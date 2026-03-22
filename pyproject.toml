@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ida-auto-mcp"
+version = "1.0.0"
+description = "Headless IDA Pro MCP server - automated binary analysis for AI agents"
+requires-python = ">=3.10"
+readme = "README.md"
+
+[project.scripts]
+ida-auto-mcp = "ida_auto_mcp.server:main"
