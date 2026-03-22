@@ -712,6 +712,424 @@ def read_bytes(
 
 
 # ============================================================================
+# Control Flow (inspired by ida-mcp-rs)
+# ============================================================================
+
+
+@tool
+def get_callers(
+    address: Annotated[str, "Function address (hex) or name"],
+    max_results: Annotated[int, "Maximum results (default 50)"] = 50,
+) -> dict:
+    """Find all functions that CALL this function. Essential for understanding who uses a function."""
+    import idautils
+    import idaapi
+    import ida_funcs
+    import ida_xref
+
+    ea = _resolve_address(address)
+    fn = idaapi.get_func(ea)
+    if not fn:
+        return {"error": f"No function at {address}"}
+
+    callers = []
+    seen = set()
+    for xref in idautils.XrefsTo(fn.start_ea):
+        if len(callers) >= max_results:
+            break
+        if xref.type in (ida_xref.fl_CN, ida_xref.fl_CF):
+            caller_fn = idaapi.get_func(xref.frm)
+            if caller_fn and caller_fn.start_ea not in seen:
+                seen.add(caller_fn.start_ea)
+                callers.append(
+                    {
+                        "address": hex(caller_fn.start_ea),
+                        "name": ida_funcs.get_func_name(caller_fn.start_ea),
+                        "call_site": hex(xref.frm),
+                    }
+                )
+
+    return {
+        "target": hex(fn.start_ea),
+        "target_name": ida_funcs.get_func_name(fn.start_ea),
+        "callers": callers,
+        "count": len(callers),
+    }
+
+
+@tool
+def get_callees(
+    address: Annotated[str, "Function address (hex) or name"],
+    max_results: Annotated[int, "Maximum results (default 50)"] = 50,
+) -> dict:
+    """Find all functions CALLED BY this function. Shows what a function depends on."""
+    import idautils
+    import idaapi
+    import ida_funcs
+    import ida_xref
+
+    ea = _resolve_address(address)
+    fn = idaapi.get_func(ea)
+    if not fn:
+        return {"error": f"No function at {address}"}
+
+    callees = []
+    seen = set()
+    for head in idautils.Heads(fn.start_ea, fn.end_ea):
+        for xref in idautils.XrefsFrom(head):
+            if len(callees) >= max_results:
+                break
+            if xref.type in (ida_xref.fl_CN, ida_xref.fl_CF):
+                target_fn = idaapi.get_func(xref.to)
+                if target_fn and target_fn.start_ea not in seen:
+                    seen.add(target_fn.start_ea)
+                    callees.append(
+                        {
+                            "address": hex(target_fn.start_ea),
+                            "name": ida_funcs.get_func_name(target_fn.start_ea),
+                            "call_site": hex(head),
+                        }
+                    )
+
+    return {
+        "source": hex(fn.start_ea),
+        "source_name": ida_funcs.get_func_name(fn.start_ea),
+        "callees": callees,
+        "count": len(callees),
+    }
+
+
+@tool
+def get_callgraph(
+    address: Annotated[str, "Root function address (hex) or name"],
+    max_depth: Annotated[int, "Maximum traversal depth (default 2)"] = 2,
+    max_nodes: Annotated[int, "Maximum nodes in graph (default 100)"] = 100,
+) -> dict:
+    """Build a call graph starting from a function, exploring callees up to max_depth. Returns nodes and edges for visualization."""
+    import idautils
+    import idaapi
+    import ida_funcs
+    import ida_xref
+    from collections import deque
+
+    ea = _resolve_address(address)
+    fn = idaapi.get_func(ea)
+    if not fn:
+        return {"error": f"No function at {address}"}
+
+    nodes = {}
+    edges = []
+    queue = deque()
+
+    root_ea = fn.start_ea
+    root_name = ida_funcs.get_func_name(root_ea)
+    nodes[root_ea] = {"address": hex(root_ea), "name": root_name}
+    queue.append((root_ea, 0))
+
+    while queue:
+        cur_ea, depth = queue.popleft()
+        if depth >= max_depth or len(nodes) >= max_nodes:
+            continue
+
+        cur_fn = idaapi.get_func(cur_ea)
+        if not cur_fn:
+            continue
+
+        for head in idautils.Heads(cur_fn.start_ea, cur_fn.end_ea):
+            for xref in idautils.XrefsFrom(head):
+                if xref.type in (ida_xref.fl_CN, ida_xref.fl_CF):
+                    target_fn = idaapi.get_func(xref.to)
+                    if target_fn:
+                        t_ea = target_fn.start_ea
+                        edges.append({"from": hex(cur_ea), "to": hex(t_ea)})
+                        if t_ea not in nodes and len(nodes) < max_nodes:
+                            nodes[t_ea] = {
+                                "address": hex(t_ea),
+                                "name": ida_funcs.get_func_name(t_ea),
+                            }
+                            queue.append((t_ea, depth + 1))
+
+    return {
+        "root": hex(root_ea),
+        "nodes": list(nodes.values()),
+        "edges": edges,
+        "node_count": len(nodes),
+        "edge_count": len(edges),
+    }
+
+
+@tool
+def get_basic_blocks(
+    address: Annotated[str, "Function address (hex) or name"],
+) -> dict:
+    """Get the basic blocks (control flow graph) of a function. Each block has start/end addresses and successor/predecessor relationships."""
+    import idaapi
+    import ida_funcs
+    import ida_gdl
+
+    ea = _resolve_address(address)
+    fn = idaapi.get_func(ea)
+    if not fn:
+        return {"error": f"No function at {address}"}
+
+    cfg = ida_gdl.FlowChart(fn)
+    blocks = []
+    for block in cfg:
+        succs = [hex(s.start_ea) for s in block.succs()]
+        preds = [hex(p.start_ea) for p in block.preds()]
+        blocks.append(
+            {
+                "start": hex(block.start_ea),
+                "end": hex(block.end_ea),
+                "size": block.end_ea - block.start_ea,
+                "successors": succs,
+                "predecessors": preds,
+            }
+        )
+
+    return {
+        "function": hex(fn.start_ea),
+        "name": ida_funcs.get_func_name(fn.start_ea),
+        "blocks": blocks,
+        "block_count": len(blocks),
+    }
+
+
+@tool
+def get_address_info(
+    address: Annotated[str, "Address (hex) to resolve"],
+) -> dict:
+    """Resolve an address to its context: which segment, function, and nearest symbol it belongs to."""
+    import idaapi
+    import ida_funcs
+    import ida_name
+    import idc
+
+    ea = _resolve_address(address)
+
+    result = {"address": hex(ea)}
+
+    seg = idaapi.getseg(ea)
+    if seg:
+        result["segment"] = {
+            "name": idaapi.get_segm_name(seg),
+            "start": hex(seg.start_ea),
+            "end": hex(seg.end_ea),
+            "permissions": _seg_perms(seg),
+        }
+
+    fn = idaapi.get_func(ea)
+    if fn:
+        result["function"] = {
+            "address": hex(fn.start_ea),
+            "name": ida_funcs.get_func_name(fn.start_ea),
+            "offset_in_func": ea - fn.start_ea,
+        }
+
+    name = ida_name.get_name(ea)
+    if name:
+        result["name"] = name
+
+    flags = idaapi.get_flags(ea)
+    result["is_code"] = idaapi.is_code(flags)
+    result["is_data"] = idaapi.is_data(flags)
+
+    return result
+
+
+# ============================================================================
+# Types & Structs (inspired by ida-mcp-rs)
+# ============================================================================
+
+
+@tool
+def list_structs(
+    filter_str: Annotated[str, "Filter struct names by substring"] = "",
+    offset: Annotated[int, "Starting index for pagination"] = 0,
+    count: Annotated[int, "Maximum results (default 100)"] = 100,
+) -> dict:
+    """List structs/unions defined in the database."""
+    import ida_struct
+    import idaapi
+
+    all_structs = []
+    idx = ida_struct.get_first_struc_idx()
+    while idx != idaapi.BADADDR:
+        sid = ida_struct.get_struc_by_idx(idx)
+        sptr = ida_struct.get_struc(sid)
+        if sptr:
+            name = ida_struct.get_struc_name(sid)
+            if not filter_str or filter_str.lower() in name.lower():
+                all_structs.append(
+                    {
+                        "id": sid,
+                        "name": name,
+                        "size": ida_struct.get_struc_size(sptr),
+                        "is_union": ida_struct.is_union(sid),
+                        "member_count": sptr.memqty,
+                    }
+                )
+        idx = ida_struct.get_next_struc_idx(idx)
+
+    total = len(all_structs)
+    page = all_structs[offset : offset + count]
+    return {"structs": page, "total": total, "offset": offset, "has_more": offset + count < total}
+
+
+@tool
+def get_struct_info(
+    name: Annotated[str, "Struct name to look up"],
+) -> dict:
+    """Get detailed struct/union info including all member fields, offsets, and types."""
+    import ida_struct
+
+    sid = ida_struct.get_struc_id(name)
+    if sid == -1:
+        return {"error": f"Struct not found: {name}"}
+
+    sptr = ida_struct.get_struc(sid)
+    if not sptr:
+        return {"error": f"Cannot load struct: {name}"}
+
+    members = []
+    for i in range(sptr.memqty):
+        member = sptr.get_member(i)
+        if member:
+            mname = ida_struct.get_member_name(member.id)
+            msize = ida_struct.get_member_size(member)
+            members.append(
+                {
+                    "name": mname,
+                    "offset": member.soff,
+                    "size": msize,
+                }
+            )
+
+    return {
+        "name": name,
+        "id": sid,
+        "size": ida_struct.get_struc_size(sptr),
+        "is_union": ida_struct.is_union(sid),
+        "member_count": sptr.memqty,
+        "members": members,
+    }
+
+
+@tool
+def get_stack_frame(
+    address: Annotated[str, "Function address (hex) or name"],
+) -> dict:
+    """Get the stack frame layout of a function, showing local variables and arguments."""
+    import idaapi
+    import ida_funcs
+    import ida_struct
+    import ida_frame
+
+    ea = _resolve_address(address)
+    fn = idaapi.get_func(ea)
+    if not fn:
+        return {"error": f"No function at {address}"}
+
+    frame = ida_frame.get_frame(fn)
+    if not frame:
+        return {
+            "function": hex(fn.start_ea),
+            "name": ida_funcs.get_func_name(fn.start_ea),
+            "error": "No stack frame",
+        }
+
+    members = []
+    for i in range(frame.memqty):
+        member = frame.get_member(i)
+        if member:
+            mname = ida_struct.get_member_name(member.id)
+            msize = ida_struct.get_member_size(member)
+            members.append(
+                {
+                    "name": mname,
+                    "offset": member.soff,
+                    "size": msize,
+                }
+            )
+
+    return {
+        "function": hex(fn.start_ea),
+        "name": ida_funcs.get_func_name(fn.start_ea),
+        "frame_size": ida_struct.get_struc_size(frame),
+        "members": members,
+        "member_count": len(members),
+    }
+
+
+@tool
+def list_entrypoints() -> dict:
+    """List all entry points of the binary (main, DllMain, TLS callbacks, etc.)."""
+    import ida_entry
+
+    entries = []
+    for i in range(ida_entry.get_entry_qty()):
+        ordinal = ida_entry.get_entry_ordinal(i)
+        ea = ida_entry.get_entry(ordinal)
+        name = ida_entry.get_entry_name(ordinal) or ""
+        entries.append(
+            {"address": hex(ea), "name": name, "ordinal": ordinal}
+        )
+
+    return {"entrypoints": entries, "count": len(entries)}
+
+
+@tool
+def patch_bytes(
+    address: Annotated[str, "Address (hex) to patch at"],
+    hex_bytes: Annotated[str, "Hex string of bytes to write (e.g. '90 90 90' or '909090')"],
+) -> dict:
+    """Patch bytes in the database at a given address. Use for binary patching (e.g. NOP out instructions)."""
+    import ida_bytes
+
+    ea = _resolve_address(address)
+
+    cleaned = hex_bytes.replace(" ", "")
+    if len(cleaned) % 2 != 0:
+        return {"error": "Hex string must have even length"}
+
+    try:
+        data = bytes.fromhex(cleaned)
+    except ValueError:
+        return {"error": f"Invalid hex string: {hex_bytes}"}
+
+    ida_bytes.patch_bytes(ea, data)
+    return {
+        "success": True,
+        "address": hex(ea),
+        "size": len(data),
+        "patched": " ".join(f"{b:02x}" for b in data),
+    }
+
+
+@tool
+def get_globals(
+    filter_str: Annotated[str, "Filter global names by substring"] = "",
+    offset: Annotated[int, "Starting index for pagination"] = 0,
+    count: Annotated[int, "Maximum results (default 100)"] = 100,
+) -> dict:
+    """List global variables/named data items (excludes functions)."""
+    import idautils
+    import idaapi
+
+    all_globals = []
+    for ea, name in idautils.Names():
+        if idaapi.get_func(ea):
+            continue
+        if filter_str and filter_str.lower() not in name.lower():
+            continue
+        all_globals.append({"address": hex(ea), "name": name})
+
+    total = len(all_globals)
+    page = all_globals[offset : offset + count]
+    return {"globals": page, "total": total, "offset": offset, "has_more": offset + count < total}
+
+
+# ============================================================================
 # Script Execution
 # ============================================================================
 

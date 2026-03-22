@@ -22,7 +22,7 @@ This makes multi-file analysis (e.g., a program with multiple DLLs) painful. **I
 - **Fully Automatic** — AI agents call `open_binary("path/to/file.dll")` to start analysis, no human in the loop
 - **Multi-Binary Sessions** — Open multiple binaries simultaneously, switch between them freely
 - **Headless** — Uses `idalib` (IDA as a library), no GUI needed
-- **25 Analysis Tools** — Decompile, disassemble, xrefs, strings, imports, search, rename, and more
+- **36 Analysis Tools** — Decompile, disassemble, xrefs, strings, imports, search, rename, and more
 - **MCP Standard** — Works with Claude Desktop, Claude Code, and any MCP-compatible client
 - **Stdio + HTTP** — Stdio transport for MCP clients, HTTP for debugging
 
@@ -93,7 +93,7 @@ python -m ida_auto_mcp --transport http --port 8765
 python -m ida_auto_mcp -v
 ```
 
-### Tools (25 total)
+### Tools (36 total)
 
 #### Session Management
 | Tool | Description |
@@ -130,6 +130,24 @@ python -m ida_auto_mcp -v
 | `list_exports` | Exported symbols |
 | `list_segments` | Memory segments/sections |
 
+#### Control Flow
+| Tool | Description |
+|------|-------------|
+| `get_callers` | Find all functions that call a given function |
+| `get_callees` | Find all functions called by a given function |
+| `get_callgraph` | Build call graph with depth control (BFS) |
+| `get_basic_blocks` | Get CFG basic blocks with successor/predecessor info |
+| `get_address_info` | Resolve address to segment/function/symbol context |
+
+#### Types & Structs
+| Tool | Description |
+|------|-------------|
+| `list_structs` | List structs/unions in the database |
+| `get_struct_info` | Get struct details with all member fields |
+| `get_stack_frame` | Get stack frame layout (locals, args) |
+| `list_entrypoints` | List binary entry points |
+| `get_globals` | List global variables |
+
 #### Search & Modify
 | Tool | Description |
 |------|-------------|
@@ -137,6 +155,7 @@ python -m ida_auto_mcp -v
 | `rename_address` | Rename function/address |
 | `set_comment` | Set disassembly comment |
 | `set_function_type` | Set function prototype |
+| `patch_bytes` | Patch bytes at an address (binary patching) |
 | `read_bytes` | Read raw bytes at address |
 | `run_script` | Execute arbitrary IDAPython code |
 
@@ -163,7 +182,7 @@ ida_auto_mcp/
 ├── mcp_server.py    # MCP protocol implementation (stdio + HTTP)
 ├── _registry.py     # Global McpServer instance + @tool decorator
 ├── session.py       # Multi-binary session management via idalib
-└── tools.py         # 25 IDA analysis tools
+└── tools.py         # 36 IDA analysis tools
 ```
 
 ### License
@@ -190,7 +209,7 @@ This project is for personal and educational use. Requires a valid IDA Pro licen
 - **全自动** — AI 直接调用 `open_binary("path/to/file.dll")` 即可开始分析，无需人工干预
 - **多文件会话** — 同时打开多个二进制文件，自由切换
 - **无需 GUI** — 使用 `idalib`（IDA 库模式），不需要打开 IDA 界面
-- **25 个分析工具** — 反编译、反汇编、交叉引用、字符串、导入表、搜索、重命名等
+- **36 个分析工具** — 反编译、反汇编、交叉引用、字符串、导入表、搜索、重命名等
 - **MCP 标准协议** — 支持 Claude Desktop、Claude Code 及所有 MCP 兼容客户端
 - **双传输模式** — stdio 模式用于 MCP 客户端，HTTP 模式用于调试
 
@@ -261,7 +280,7 @@ python -m ida_auto_mcp --transport http --port 8765
 python -m ida_auto_mcp -v
 ```
 
-### 工具列表（共 25 个）
+### 工具列表（共 36 个）
 
 #### 会话管理
 | 工具 | 说明 |
@@ -298,6 +317,24 @@ python -m ida_auto_mcp -v
 | `list_exports` | 列出导出符号 |
 | `list_segments` | 列出内存段/节 |
 
+#### 控制流分析
+| 工具 | 说明 |
+|------|------|
+| `get_callers` | 查找调用指定函数的所有函数 |
+| `get_callees` | 查找指定函数调用的所有函数 |
+| `get_callgraph` | 构建调用图（BFS，支持深度控制） |
+| `get_basic_blocks` | 获取函数的基本块（CFG） |
+| `get_address_info` | 解析地址所属的段/函数/符号 |
+
+#### 类型与结构体
+| 工具 | 说明 |
+|------|------|
+| `list_structs` | 列出数据库中的结构体/联合体 |
+| `get_struct_info` | 获取结构体详细信息（含所有字段） |
+| `get_stack_frame` | 获取函数栈帧布局 |
+| `list_entrypoints` | 列出二进制入口点 |
+| `get_globals` | 列出全局变量 |
+
 #### 搜索与修改
 | 工具 | 说明 |
 |------|------|
@@ -305,6 +342,7 @@ python -m ida_auto_mcp -v
 | `rename_address` | 重命名函数/地址 |
 | `set_comment` | 设置反汇编注释 |
 | `set_function_type` | 设置函数原型 |
+| `patch_bytes` | 在指定地址写入字节（二进制补丁） |
 | `read_bytes` | 读取指定地址的原始字节 |
 | `run_script` | 执行 IDAPython 脚本 |
 
