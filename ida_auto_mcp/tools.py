@@ -949,27 +949,33 @@ def list_structs(
     count: Annotated[int, "Maximum results (default 100)"] = 100,
 ) -> dict:
     """List structs/unions defined in the database."""
-    import ida_struct
-    import idaapi
+    import ida_typeinf
+
+    til = ida_typeinf.get_idati()
+    limit = ida_typeinf.get_ordinal_limit(til)
 
     all_structs = []
-    idx = ida_struct.get_first_struc_idx()
-    while idx != idaapi.BADADDR:
-        sid = ida_struct.get_struc_by_idx(idx)
-        sptr = ida_struct.get_struc(sid)
-        if sptr:
-            name = ida_struct.get_struc_name(sid)
-            if not filter_str or filter_str.lower() in name.lower():
-                all_structs.append(
-                    {
-                        "id": sid,
-                        "name": name,
-                        "size": ida_struct.get_struc_size(sptr),
-                        "is_union": ida_struct.is_union(sid),
-                        "member_count": sptr.memqty,
-                    }
-                )
-        idx = ida_struct.get_next_struc_idx(idx)
+    for ordinal in range(1, limit):
+        tif = ida_typeinf.tinfo_t()
+        if not tif.get_numbered_type(til, ordinal):
+            continue
+        if not (tif.is_struct() or tif.is_union()):
+            continue
+        name = tif.get_type_name()
+        if filter_str and filter_str.lower() not in name.lower():
+            continue
+
+        udt = ida_typeinf.udt_type_data_t()
+        tif.get_udt_details(udt)
+        all_structs.append(
+            {
+                "ordinal": ordinal,
+                "name": name,
+                "size": tif.get_size(),
+                "is_union": tif.is_union(),
+                "member_count": len(udt),
+            }
+        )
 
     total = len(all_structs)
     page = all_structs[offset : offset + count]
@@ -981,36 +987,35 @@ def get_struct_info(
     name: Annotated[str, "Struct name to look up"],
 ) -> dict:
     """Get detailed struct/union info including all member fields, offsets, and types."""
-    import ida_struct
+    import ida_typeinf
 
-    sid = ida_struct.get_struc_id(name)
-    if sid == -1:
+    tif = ida_typeinf.tinfo_t()
+    if not tif.get_named_type(ida_typeinf.get_idati(), name):
         return {"error": f"Struct not found: {name}"}
 
-    sptr = ida_struct.get_struc(sid)
-    if not sptr:
-        return {"error": f"Cannot load struct: {name}"}
+    if not (tif.is_struct() or tif.is_union()):
+        return {"error": f"{name} is not a struct/union"}
+
+    udt = ida_typeinf.udt_type_data_t()
+    if not tif.get_udt_details(udt):
+        return {"error": f"Cannot get details for {name}"}
 
     members = []
-    for i in range(sptr.memqty):
-        member = sptr.get_member(i)
-        if member:
-            mname = ida_struct.get_member_name(member.id)
-            msize = ida_struct.get_member_size(member)
-            members.append(
-                {
-                    "name": mname,
-                    "offset": member.soff,
-                    "size": msize,
-                }
-            )
+    for member in udt:
+        members.append(
+            {
+                "name": member.name,
+                "offset": member.offset // 8,
+                "size": member.size // 8,
+                "type": str(member.type),
+            }
+        )
 
     return {
         "name": name,
-        "id": sid,
-        "size": ida_struct.get_struc_size(sptr),
-        "is_union": ida_struct.is_union(sid),
-        "member_count": sptr.memqty,
+        "size": tif.get_size(),
+        "is_union": tif.is_union(),
+        "member_count": len(udt),
         "members": members,
     }
 
@@ -1022,7 +1027,7 @@ def get_stack_frame(
     """Get the stack frame layout of a function, showing local variables and arguments."""
     import idaapi
     import ida_funcs
-    import ida_struct
+    import ida_typeinf
     import ida_frame
 
     ea = _resolve_address(address)
@@ -1030,32 +1035,36 @@ def get_stack_frame(
     if not fn:
         return {"error": f"No function at {address}"}
 
-    frame = ida_frame.get_frame(fn)
-    if not frame:
+    frame_tif = ida_typeinf.tinfo_t()
+    if not ida_frame.get_func_frame(frame_tif, fn):
         return {
             "function": hex(fn.start_ea),
             "name": ida_funcs.get_func_name(fn.start_ea),
             "error": "No stack frame",
         }
 
+    udt = ida_typeinf.udt_type_data_t()
+    if not frame_tif.get_udt_details(udt):
+        return {
+            "function": hex(fn.start_ea),
+            "name": ida_funcs.get_func_name(fn.start_ea),
+            "error": "Cannot read frame details",
+        }
+
     members = []
-    for i in range(frame.memqty):
-        member = frame.get_member(i)
-        if member:
-            mname = ida_struct.get_member_name(member.id)
-            msize = ida_struct.get_member_size(member)
-            members.append(
-                {
-                    "name": mname,
-                    "offset": member.soff,
-                    "size": msize,
-                }
-            )
+    for member in udt:
+        members.append(
+            {
+                "name": member.name,
+                "offset": member.offset // 8,
+                "size": member.size // 8,
+            }
+        )
 
     return {
         "function": hex(fn.start_ea),
         "name": ida_funcs.get_func_name(fn.start_ea),
-        "frame_size": ida_struct.get_struc_size(frame),
+        "frame_size": frame_tif.get_size(),
         "members": members,
         "member_count": len(members),
     }
