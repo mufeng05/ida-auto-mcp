@@ -82,6 +82,83 @@ def get_current_session() -> dict:
 
 
 # ============================================================================
+# Server Management
+# ============================================================================
+
+
+@tool
+def server_health() -> dict:
+    """Health check for the MCP server. Reports server status, active session, IDA analysis state, and available subsystems."""
+    import ida_auto
+
+    result = {
+        "status": "ok",
+        "server": "ida-auto-mcp",
+    }
+
+    session = get_manager().get_current()
+    if session:
+        result["session"] = session.to_dict()
+        result["auto_analysis_done"] = bool(ida_auto.auto_is_ok())
+    else:
+        result["session"] = None
+        result["auto_analysis_done"] = None
+
+    # Check Hex-Rays availability
+    try:
+        import ida_hexrays
+
+        result["hexrays_available"] = bool(ida_hexrays.init_hexrays_plugin())
+    except Exception:
+        result["hexrays_available"] = False
+
+    result["open_sessions"] = len(get_manager().list_sessions())
+    return result
+
+
+@tool
+def server_warmup(
+    init_hexrays: Annotated[
+        bool, "Initialize Hex-Rays decompiler plugin"
+    ] = True,
+    build_string_cache: Annotated[
+        bool, "Pre-build the string list cache"
+    ] = True,
+) -> dict:
+    """Warm up IDA subsystems to reduce first-call latency. Call after open_binary to speed up subsequent tool calls."""
+    warmed = []
+
+    if init_hexrays:
+        try:
+            import ida_hexrays
+
+            if ida_hexrays.init_hexrays_plugin():
+                warmed.append("hexrays")
+        except Exception:
+            pass
+
+    if build_string_cache:
+        try:
+            import idautils
+
+            count = sum(1 for _ in idautils.Strings())
+            warmed.append(f"strings({count})")
+        except Exception:
+            pass
+
+    # Warm up function list
+    try:
+        import idautils
+
+        count = sum(1 for _ in idautils.Functions())
+        warmed.append(f"functions({count})")
+    except Exception:
+        pass
+
+    return {"success": True, "warmed": warmed}
+
+
+# ============================================================================
 # Database Info
 # ============================================================================
 
@@ -673,6 +750,7 @@ def rename_address(
     ea = _resolve_address(address)
     ok = idaapi.set_name(ea, new_name, idaapi.SN_NOWARN | idaapi.SN_NOCHECK)
     if ok:
+        _invalidate_decompiler_cache(ea)
         return {"success": True, "address": hex(ea), "new_name": new_name}
     return {
         "success": False,
@@ -709,6 +787,8 @@ def set_function_type(
 
     ea = _resolve_address(address)
     ok = idc.SetType(ea, type_str)
+    if ok:
+        _invalidate_decompiler_cache(ea)
     return {"success": bool(ok), "address": hex(ea), "type": type_str}
 
 
@@ -1290,6 +1370,7 @@ def apply_type(
 
     # Try setting as function type first
     if idc.SetType(ea, type_str):
+        _invalidate_decompiler_cache(ea)
         return {"success": True, "address": hex(ea), "type": type_str}
 
     # Try parsing and applying manually
@@ -1298,6 +1379,7 @@ def apply_type(
     result = ida_typeinf.parse_decl(tif, til, type_str, ida_typeinf.PT_TYP)
     if result is not None:
         if ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.TINFO_DEFINITE):
+            _invalidate_decompiler_cache(ea)
             return {"success": True, "address": hex(ea), "type": str(tif)}
 
     return {"success": False, "error": f"Failed to apply type '{type_str}' at {address}"}
@@ -1643,6 +1725,301 @@ def delete_stack_var(
     # IDA 9.3 API: delete_frame_members(pfn, start_offset, end_offset)
     ok = ida_frame.delete_frame_members(fn, var_offset, var_offset + size)
     return {"success": bool(ok), "address": hex(ea), "offset": var_offset}
+
+
+# ============================================================================
+# Enhanced Type System
+# ============================================================================
+
+
+@tool
+def enum_upsert(
+    name: Annotated[str, "Enum type name"],
+    members: Annotated[
+        list[dict],
+        "List of {name, value} dicts, e.g. [{'name':'FLAG_A','value':1},{'name':'FLAG_B','value':2}]",
+    ],
+    bitfield: Annotated[bool, "Treat as a bitfield enum"] = False,
+) -> dict:
+    """Create or extend an enum type. Idempotent - existing members are preserved, new ones are added."""
+    import ida_typeinf
+
+    til = ida_typeinf.get_idati()
+
+    # Check if enum already exists
+    tif = ida_typeinf.tinfo_t()
+    existing = tif.get_named_type(til, name)
+
+    if existing and tif.is_enum():
+        # Extend existing enum
+        edt = ida_typeinf.enum_type_data_t()
+        if not tif.get_enum_details(edt):
+            return {"error": f"Cannot read existing enum {name}"}
+
+        existing_names = {m.name for m in edt}
+        total_before = len(edt)
+        added = []
+        for m in members:
+            m_name = m.get("name", "")
+            m_value = m.get("value", 0)
+            if m_name and m_name not in existing_names:
+                em = ida_typeinf.edm_t()
+                em.name = m_name
+                em.value = m_value
+                edt.push_back(em)
+                added.append(m_name)
+
+        total_after = total_before + len(added)
+        if added:
+            tif2 = ida_typeinf.tinfo_t()
+            tif2.create_enum(edt)
+            ordinal = tif.get_ordinal()
+            tif2.set_numbered_type(til, ordinal, ida_typeinf.NTF_REPLACE, name)
+
+        return {
+            "success": True,
+            "name": name,
+            "action": "extended",
+            "added_members": added,
+            "total_members": total_after,
+        }
+    else:
+        # Create new enum
+        edt = ida_typeinf.enum_type_data_t()
+        if bitfield:
+            edt.bte = ida_typeinf.BTE_HEX | ida_typeinf.BTE_BITFIELD
+
+        added_count = 0
+        for m in members:
+            m_name = m.get("name", "")
+            m_value = m.get("value", 0)
+            if m_name:
+                em = ida_typeinf.edm_t()
+                em.name = m_name
+                em.value = m_value
+                edt.push_back(em)
+                added_count += 1
+
+        tif_new = ida_typeinf.tinfo_t()
+        tif_new.create_enum(edt)
+        ordinal = ida_typeinf.alloc_type_ordinal(til)
+        tif_new.set_numbered_type(til, ordinal, ida_typeinf.NTF_REPLACE, name)
+
+        return {
+            "success": True,
+            "name": name,
+            "action": "created",
+            "ordinal": ordinal,
+            "member_count": added_count,
+        }
+
+
+@tool
+def type_query(
+    filter_str: Annotated[str, "Filter type names by substring"] = "",
+    kind: Annotated[
+        str,
+        "Filter by kind: 'struct', 'union', 'enum', 'typedef', 'func', or '' for all",
+    ] = "",
+    include_members: Annotated[
+        bool, "Include member details for structs/unions/enums"
+    ] = False,
+    offset: Annotated[int, "Starting index for pagination"] = 0,
+    count: Annotated[int, "Maximum results (default 50)"] = 50,
+) -> dict:
+    """Advanced query over the local type library with optional member inspection. More powerful than list_local_types."""
+    import ida_typeinf
+
+    til = ida_typeinf.get_idati()
+    limit = ida_typeinf.get_ordinal_limit(til)
+
+    all_types = []
+    for ordinal in range(1, limit):
+        tif = ida_typeinf.tinfo_t()
+        if not tif.get_numbered_type(til, ordinal):
+            continue
+        name = tif.get_type_name()
+        if not name:
+            continue
+
+        if tif.is_struct():
+            t_kind = "struct"
+        elif tif.is_union():
+            t_kind = "union"
+        elif tif.is_enum():
+            t_kind = "enum"
+        elif tif.is_func():
+            t_kind = "func"
+        else:
+            t_kind = "typedef"
+
+        if kind and t_kind != kind:
+            continue
+        if filter_str and filter_str.lower() not in name.lower():
+            continue
+
+        entry = {
+            "ordinal": ordinal,
+            "name": name,
+            "kind": t_kind,
+            "size": tif.get_size(),
+            "declaration": str(tif),
+        }
+
+        if include_members and t_kind in ("struct", "union"):
+            udt = ida_typeinf.udt_type_data_t()
+            if tif.get_udt_details(udt):
+                entry["members"] = [
+                    {
+                        "name": m.name,
+                        "offset": m.offset // 8,
+                        "size": m.size // 8,
+                        "type": str(m.type),
+                    }
+                    for m in udt
+                ]
+        elif include_members and t_kind == "enum":
+            edt = ida_typeinf.enum_type_data_t()
+            if tif.get_enum_details(edt):
+                entry["members"] = [
+                    {"name": m.name, "value": m.value} for m in edt
+                ]
+
+        all_types.append(entry)
+
+    total = len(all_types)
+    page = all_types[offset: offset + count]
+    return {
+        "types": page,
+        "total": total,
+        "offset": offset,
+        "has_more": offset + count < total,
+    }
+
+
+@tool
+def type_inspect(
+    name: Annotated[str, "Type name to inspect"],
+    include_members: Annotated[
+        bool, "Include member/field details"
+    ] = True,
+) -> dict:
+    """Inspect a named type in detail: size, kind, full declaration, and members. Works for structs, unions, enums, and typedefs."""
+    import ida_typeinf
+
+    tif = ida_typeinf.tinfo_t()
+    if not tif.get_named_type(ida_typeinf.get_idati(), name):
+        return {"error": f"Type not found: {name}"}
+
+    if tif.is_struct():
+        t_kind = "struct"
+    elif tif.is_union():
+        t_kind = "union"
+    elif tif.is_enum():
+        t_kind = "enum"
+    elif tif.is_func():
+        t_kind = "func"
+    else:
+        t_kind = "typedef"
+
+    result = {
+        "name": name,
+        "kind": t_kind,
+        "size": tif.get_size(),
+        "ordinal": tif.get_ordinal(),
+        "declaration": str(tif),
+    }
+
+    if include_members:
+        if t_kind in ("struct", "union"):
+            udt = ida_typeinf.udt_type_data_t()
+            if tif.get_udt_details(udt):
+                result["members"] = [
+                    {
+                        "name": m.name,
+                        "offset": m.offset // 8,
+                        "size": m.size // 8,
+                        "type": str(m.type),
+                    }
+                    for m in udt
+                ]
+                result["member_count"] = len(udt)
+        elif t_kind == "enum":
+            edt = ida_typeinf.enum_type_data_t()
+            if tif.get_enum_details(edt):
+                result["members"] = [
+                    {"name": m.name, "value": m.value} for m in edt
+                ]
+                result["member_count"] = len(edt)
+
+    return result
+
+
+@tool
+def xrefs_to_field(
+    struct_name: Annotated[str, "Name of the struct"],
+    field_name: Annotated[str, "Name of the field/member to find references to"],
+    max_results: Annotated[int, "Maximum results (default 50)"] = 50,
+) -> dict:
+    """Get cross-references to a specific struct field member. Finds code that accesses this particular field."""
+    import ida_typeinf
+    import idaapi
+    import idautils
+    import ida_funcs
+
+    til = ida_typeinf.get_idati()
+    tif = ida_typeinf.tinfo_t()
+    if not tif.get_named_type(til, struct_name):
+        return {"error": f"Struct not found: {struct_name}"}
+
+    if not (tif.is_struct() or tif.is_union()):
+        return {"error": f"{struct_name} is not a struct/union"}
+
+    udt = ida_typeinf.udt_type_data_t()
+    if not tif.get_udt_details(udt):
+        return {"error": f"Cannot get details for {struct_name}"}
+
+    # Find the target field
+    target_offset = None
+    target_size = None
+    for member in udt:
+        if member.name == field_name:
+            target_offset = member.offset // 8
+            target_size = member.size // 8
+            break
+
+    if target_offset is None:
+        return {
+            "error": f"Field '{field_name}' not found in {struct_name}",
+            "available_fields": [m.name for m in udt],
+        }
+
+    # Get struct member xrefs via IDA 9.3 tinfo_t API
+    xrefs = []
+    udm = ida_typeinf.udm_t()
+    udm.name = field_name
+    idx = tif.find_udm(udm, ida_typeinf.STRMEM_NAME)
+    if idx >= 0:
+        member_tid = tif.get_udm_tid(idx)
+        if member_tid != idaapi.BADADDR:
+            for xref in idautils.XrefsTo(member_tid):
+                if len(xrefs) >= max_results:
+                    break
+                fn = idaapi.get_func(xref.frm)
+                xrefs.append({
+                    "from_address": hex(xref.frm),
+                    "type": _xref_type_name(xref.type),
+                    "function": ida_funcs.get_func_name(fn.start_ea) if fn else None,
+                })
+
+    return {
+        "struct": struct_name,
+        "field": field_name,
+        "field_offset": target_offset,
+        "field_size": target_size,
+        "xrefs": xrefs,
+        "count": len(xrefs),
+    }
 
 
 # ============================================================================
@@ -2152,6 +2529,435 @@ def analyze_function(
 
 
 # ============================================================================
+# Enhanced Analysis
+# ============================================================================
+
+
+@tool
+def func_profile(
+    addresses: Annotated[
+        list[str],
+        "List of function addresses (hex) or names to profile",
+    ],
+) -> dict:
+    """Profile one or more functions with summary metrics: caller/callee count, string references, block count, size, and cyclomatic complexity."""
+    import idaapi
+    import ida_funcs
+    import ida_gdl
+    import ida_xref
+    import idc
+    import idautils
+
+    results = []
+    for addr in addresses:
+        try:
+            ea = _resolve_address(addr)
+            fn = idaapi.get_func(ea)
+            if not fn:
+                results.append({"address": addr, "error": f"No function at {addr}"})
+                continue
+
+            name = ida_funcs.get_func_name(fn.start_ea)
+            size = fn.end_ea - fn.start_ea
+
+            # Count callers
+            caller_count = 0
+            seen_callers = set()
+            for xref in idautils.XrefsTo(fn.start_ea):
+                if xref.type in (ida_xref.fl_CN, ida_xref.fl_CF):
+                    caller_fn = idaapi.get_func(xref.frm)
+                    if caller_fn and caller_fn.start_ea not in seen_callers:
+                        seen_callers.add(caller_fn.start_ea)
+                        caller_count += 1
+
+            # Count callees
+            callee_count = 0
+            seen_callees = set()
+            for head in idautils.Heads(fn.start_ea, fn.end_ea):
+                for xref in idautils.XrefsFrom(head):
+                    if xref.type in (ida_xref.fl_CN, ida_xref.fl_CF):
+                        target_fn = idaapi.get_func(xref.to)
+                        if target_fn and target_fn.start_ea not in seen_callees:
+                            seen_callees.add(target_fn.start_ea)
+                            callee_count += 1
+
+            # Count strings
+            string_count = 0
+            for head in idautils.Heads(fn.start_ea, fn.end_ea):
+                for xref in idautils.XrefsFrom(head):
+                    s = idc.get_strlit_contents(xref.to, -1, idc.STRTYPE_C)
+                    if s:
+                        string_count += 1
+
+            # CFG metrics
+            cfg = ida_gdl.FlowChart(fn)
+            block_count = 0
+            edge_count = 0
+            for block in cfg:
+                block_count += 1
+                edge_count += sum(1 for _ in block.succs())
+
+            results.append({
+                "address": hex(fn.start_ea),
+                "name": name,
+                "size": size,
+                "caller_count": caller_count,
+                "callee_count": callee_count,
+                "string_count": string_count,
+                "block_count": block_count,
+                "edge_count": edge_count,
+                "cyclomatic_complexity": edge_count - block_count + 2,
+            })
+        except Exception as e:
+            results.append({"address": addr, "error": str(e)})
+
+    return {"results": results, "count": len(results)}
+
+
+@tool
+def analyze_batch(
+    addresses: Annotated[list[str], "List of function addresses (hex) or names"],
+    include_decompile: Annotated[bool, "Include Hex-Rays pseudocode"] = True,
+    include_disasm: Annotated[bool, "Include assembly disassembly"] = False,
+    include_xrefs: Annotated[bool, "Include callers and callees"] = True,
+    include_strings: Annotated[bool, "Include referenced strings"] = True,
+    include_cfg: Annotated[bool, "Include basic block / CFG info"] = False,
+) -> dict:
+    """Comprehensive per-function analysis with selectable sections. More flexible than analyze_function - choose exactly what data you need."""
+    import idaapi
+    import ida_funcs
+    import ida_hexrays
+    import ida_gdl
+    import ida_xref
+    import idc
+    import idautils
+
+    hexrays_ok = False
+    if include_decompile:
+        try:
+            hexrays_ok = bool(ida_hexrays.init_hexrays_plugin())
+        except Exception:
+            pass
+
+    results = []
+    for addr in addresses:
+        try:
+            ea = _resolve_address(addr)
+            fn = idaapi.get_func(ea)
+            if not fn:
+                results.append({"address": addr, "error": f"No function at {addr}"})
+                continue
+
+            entry = {
+                "address": hex(fn.start_ea),
+                "name": ida_funcs.get_func_name(fn.start_ea),
+                "size": fn.end_ea - fn.start_ea,
+            }
+
+            if include_decompile and hexrays_ok:
+                try:
+                    cfunc = ida_hexrays.decompile(fn.start_ea)
+                    entry["pseudocode"] = str(cfunc) if cfunc else None
+                except Exception as e:
+                    entry["pseudocode_error"] = str(e)
+
+            if include_disasm:
+                lines = []
+                for head in idautils.Heads(fn.start_ea, fn.end_ea):
+                    lines.append({"address": hex(head), "disasm": idc.GetDisasm(head)})
+                    if len(lines) >= 300:
+                        break
+                entry["disassembly"] = lines
+
+            if include_xrefs:
+                callers = []
+                seen = set()
+                for xref in idautils.XrefsTo(fn.start_ea):
+                    if xref.type in (ida_xref.fl_CN, ida_xref.fl_CF):
+                        cfn = idaapi.get_func(xref.frm)
+                        if cfn and cfn.start_ea not in seen:
+                            seen.add(cfn.start_ea)
+                            callers.append({
+                                "address": hex(cfn.start_ea),
+                                "name": ida_funcs.get_func_name(cfn.start_ea),
+                            })
+                entry["callers"] = callers[:30]
+
+                callees = []
+                seen = set()
+                for head in idautils.Heads(fn.start_ea, fn.end_ea):
+                    for xref in idautils.XrefsFrom(head):
+                        if xref.type in (ida_xref.fl_CN, ida_xref.fl_CF):
+                            tfn = idaapi.get_func(xref.to)
+                            if tfn and tfn.start_ea not in seen:
+                                seen.add(tfn.start_ea)
+                                callees.append({
+                                    "address": hex(tfn.start_ea),
+                                    "name": ida_funcs.get_func_name(tfn.start_ea),
+                                })
+                entry["callees"] = callees[:30]
+
+            if include_strings:
+                strings = []
+                seen_addrs = set()
+                for head in idautils.Heads(fn.start_ea, fn.end_ea):
+                    for xref in idautils.XrefsFrom(head):
+                        if xref.to in seen_addrs:
+                            continue
+                        s = idc.get_strlit_contents(xref.to, -1, idc.STRTYPE_C)
+                        if s:
+                            seen_addrs.add(xref.to)
+                            text = s.decode("utf-8", errors="replace") if isinstance(s, bytes) else str(s)
+                            strings.append({"address": hex(xref.to), "string": text[:120]})
+                entry["strings"] = strings[:30]
+
+            if include_cfg:
+                cfg = ida_gdl.FlowChart(fn)
+                blocks = []
+                edge_count = 0
+                for block in cfg:
+                    edge_count += sum(1 for _ in block.succs())
+                    blocks.append({
+                        "start": hex(block.start_ea),
+                        "end": hex(block.end_ea),
+                        "successors": [hex(s.start_ea) for s in block.succs()],
+                    })
+                entry["blocks"] = blocks
+                entry["block_count"] = len(blocks)
+                entry["cyclomatic_complexity"] = edge_count - len(blocks) + 2
+
+            results.append(entry)
+        except Exception as e:
+            results.append({"address": addr, "error": str(e)})
+
+    return {"results": results, "count": len(results)}
+
+
+@tool
+def analyze_component(
+    addresses: Annotated[
+        list[str],
+        "List of related function addresses (hex) or names to analyze as a group",
+    ],
+) -> dict:
+    """Analyze related functions as a group: per-function summaries, internal call graph, and shared data references. Useful for understanding a subsystem or module."""
+    import idaapi
+    import ida_funcs
+    import ida_xref
+    import idc
+    import idautils
+
+    eas = []
+    ea_set = set()
+    for addr in addresses:
+        try:
+            ea = _resolve_address(addr)
+            fn = idaapi.get_func(ea)
+            if fn:
+                eas.append(fn.start_ea)
+                ea_set.add(fn.start_ea)
+        except Exception:
+            pass
+
+    if not eas:
+        return {"error": "No valid functions found"}
+
+    # Per-function summaries
+    summaries = []
+    all_strings = {}  # address -> text
+    for func_ea in eas:
+        fn = idaapi.get_func(func_ea)
+        name = ida_funcs.get_func_name(func_ea)
+
+        # Strings referenced
+        for head in idautils.Heads(fn.start_ea, fn.end_ea):
+            for xref in idautils.XrefsFrom(head):
+                s = idc.get_strlit_contents(xref.to, -1, idc.STRTYPE_C)
+                if s:
+                    text = s.decode("utf-8", errors="replace") if isinstance(s, bytes) else str(s)
+                    all_strings[xref.to] = text
+
+        summaries.append({
+            "address": hex(func_ea),
+            "name": name,
+            "size": fn.end_ea - fn.start_ea,
+        })
+
+    # Internal call graph (only edges between component functions)
+    internal_edges = []
+    external_callees = {}  # address -> name
+    for func_ea in eas:
+        fn = idaapi.get_func(func_ea)
+        for head in idautils.Heads(fn.start_ea, fn.end_ea):
+            for xref in idautils.XrefsFrom(head):
+                if xref.type in (ida_xref.fl_CN, ida_xref.fl_CF):
+                    tfn = idaapi.get_func(xref.to)
+                    if tfn:
+                        if tfn.start_ea in ea_set:
+                            internal_edges.append({
+                                "from": hex(func_ea),
+                                "to": hex(tfn.start_ea),
+                            })
+                        else:
+                            external_callees[tfn.start_ea] = ida_funcs.get_func_name(tfn.start_ea)
+
+    # Deduplicate edges
+    seen_edges = set()
+    unique_edges = []
+    for e in internal_edges:
+        key = (e["from"], e["to"])
+        if key not in seen_edges:
+            seen_edges.add(key)
+            unique_edges.append(e)
+
+    # Shared strings (referenced by more than one function)
+    string_refs = {}
+    for func_ea in eas:
+        fn = idaapi.get_func(func_ea)
+        for head in idautils.Heads(fn.start_ea, fn.end_ea):
+            for xref in idautils.XrefsFrom(head):
+                if xref.to in all_strings:
+                    string_refs.setdefault(xref.to, set()).add(func_ea)
+
+    shared_strings = [
+        {"address": hex(addr), "string": all_strings[addr][:100],
+         "referenced_by": [hex(ea) for ea in funcs]}
+        for addr, funcs in string_refs.items()
+        if len(funcs) > 1
+    ]
+
+    return {
+        "functions": summaries,
+        "function_count": len(summaries),
+        "internal_call_graph": unique_edges,
+        "external_callees": [
+            {"address": hex(ea), "name": name}
+            for ea, name in list(external_callees.items())[:30]
+        ],
+        "shared_strings": shared_strings[:20],
+    }
+
+
+@tool
+def analyze_strings(
+    filter_str: Annotated[str, "Substring filter for string content"] = "",
+    offset: Annotated[int, "Starting index for pagination"] = 0,
+    count: Annotated[int, "Maximum results (default 50)"] = 50,
+    max_xrefs: Annotated[int, "Maximum xrefs per string (default 10)"] = 10,
+) -> dict:
+    """List strings with their cross-references combined. More efficient than calling list_strings + get_xrefs_to separately."""
+    import idautils
+    import idaapi
+    import ida_funcs
+
+    all_results = []
+    for s in idautils.Strings():
+        if s is None:
+            continue
+        text = str(s)
+        if filter_str and filter_str.lower() not in text.lower():
+            continue
+
+        xrefs = []
+        for xref in idautils.XrefsTo(s.ea):
+            if len(xrefs) >= max_xrefs:
+                break
+            fn = idaapi.get_func(xref.frm)
+            xrefs.append({
+                "from_address": hex(xref.frm),
+                "type": _xref_type_name(xref.type),
+                "function": ida_funcs.get_func_name(fn.start_ea) if fn else None,
+            })
+
+        all_results.append({
+            "address": hex(s.ea),
+            "text": text,
+            "length": s.length,
+            "xref_count": len(xrefs),
+            "xrefs": xrefs,
+        })
+
+    total = len(all_results)
+    page = all_results[offset: offset + count]
+    return {
+        "strings": page,
+        "total": total,
+        "offset": offset,
+        "has_more": offset + count < total,
+    }
+
+
+@tool
+def diff_before_after(
+    address: Annotated[str, "Function address (hex) or name"],
+    action: Annotated[
+        str,
+        "Action to perform: 'rename', 'set_type', or 'set_comment'",
+    ],
+    new_name: Annotated[str, "New name (for action='rename')"] = "",
+    new_type: Annotated[str, "New type string (for action='set_type')"] = "",
+    comment: Annotated[str, "Comment text (for action='set_comment')"] = "",
+) -> dict:
+    """Apply a modification and return before/after decompilation so you can immediately see the effect. Supported actions: rename, set_type, set_comment."""
+    import idaapi
+    import ida_hexrays
+    import ida_funcs
+    import idc
+
+    ea = _resolve_address(address)
+    fn = idaapi.get_func(ea)
+    if not fn:
+        return {"error": f"No function at {address}"}
+
+    if not ida_hexrays.init_hexrays_plugin():
+        return {"error": "Hex-Rays decompiler not available"}
+
+    # Capture BEFORE
+    try:
+        cfunc = ida_hexrays.decompile(fn.start_ea)
+        before = str(cfunc) if cfunc else "<decompilation failed>"
+    except Exception as e:
+        before = f"<decompilation failed: {e}>"
+
+    # Apply action
+    action_result = {}
+    if action == "rename":
+        if not new_name:
+            return {"error": "new_name is required for rename action"}
+        ok = idaapi.set_name(ea, new_name, idaapi.SN_NOWARN | idaapi.SN_NOCHECK)
+        action_result = {"success": bool(ok), "new_name": new_name}
+    elif action == "set_type":
+        if not new_type:
+            return {"error": "new_type is required for set_type action"}
+        ok = idc.SetType(ea, new_type)
+        action_result = {"success": bool(ok), "new_type": new_type}
+    elif action == "set_comment":
+        if not comment:
+            return {"error": "comment is required for set_comment action"}
+        ok = idc.set_cmt(ea, comment, 0)
+        action_result = {"success": bool(ok), "comment": comment}
+    else:
+        return {"error": f"Unknown action: {action}. Use 'rename', 'set_type', or 'set_comment'"}
+
+    # Invalidate cache and capture AFTER
+    _invalidate_decompiler_cache(ea)
+    try:
+        cfunc = ida_hexrays.decompile(fn.start_ea)
+        after = str(cfunc) if cfunc else "<decompilation failed>"
+    except Exception as e:
+        after = f"<decompilation failed: {e}>"
+
+    return {
+        "address": hex(fn.start_ea),
+        "function": ida_funcs.get_func_name(fn.start_ea),
+        "action": action,
+        "action_result": action_result,
+        "before": before,
+        "after": after,
+    }
+
+
+# ============================================================================
 # Type Inference
 # ============================================================================
 
@@ -2387,6 +3193,263 @@ def pseudocode_at(
 
 
 # ============================================================================
+# Enhanced Memory Reading
+# ============================================================================
+
+
+@tool
+def get_int(
+    address: Annotated[str, "Address (hex) to read from"],
+    int_type: Annotated[
+        str,
+        "Integer type: u8, i8, u16, i16, u32, i32, u64, i64 (default u32)",
+    ] = "u32",
+) -> dict:
+    """Read a typed integer value from memory. Supports signed/unsigned 8/16/32/64-bit reads."""
+    import idc
+
+    ea = _resolve_address(address)
+
+    TYPE_SIZES = {
+        "u8": 1, "i8": 1,
+        "u16": 2, "i16": 2,
+        "u32": 4, "i32": 4,
+        "u64": 8, "i64": 8,
+    }
+    size = TYPE_SIZES.get(int_type)
+    if size is None:
+        return {"error": f"Unknown type: {int_type}. Use: u8, i8, u16, i16, u32, i32, u64, i64"}
+
+    data = idc.get_bytes(ea, size)
+    if data is None:
+        return {"error": f"Cannot read {size} bytes at {address}"}
+
+    unsigned = int.from_bytes(data, "little")
+    bits = size * 8
+    if int_type.startswith("i"):
+        signed = unsigned if unsigned < (1 << (bits - 1)) else unsigned - (1 << bits)
+    else:
+        signed = None
+
+    return {
+        "address": hex(ea),
+        "type": int_type,
+        "value": signed if signed is not None else unsigned,
+        "unsigned": unsigned,
+        "hex": hex(unsigned),
+        "raw_bytes": data.hex(),
+    }
+
+
+@tool
+def get_global_value(
+    name_or_address: Annotated[
+        str,
+        "Global variable name or address (hex)",
+    ],
+) -> dict:
+    """Read a global variable's value by name or address. Reads 8 bytes and shows as multiple integer interpretations."""
+    import idc
+    import idaapi
+    import ida_name
+
+    ea = _resolve_address(name_or_address)
+    name = ida_name.get_name(ea) or ""
+    data = idc.get_bytes(ea, 8)
+    if data is None:
+        return {"error": f"Cannot read at {name_or_address}"}
+
+    result = {
+        "address": hex(ea),
+        "name": name,
+        "raw_hex": data.hex(),
+    }
+
+    # Show interpretations
+    result["as_u8"] = data[0]
+    result["as_u16"] = int.from_bytes(data[:2], "little")
+    result["as_u32"] = int.from_bytes(data[:4], "little")
+    result["as_u32_hex"] = hex(int.from_bytes(data[:4], "little"))
+    result["as_u64"] = int.from_bytes(data[:8], "little")
+    result["as_u64_hex"] = hex(int.from_bytes(data[:8], "little"))
+
+    # Check if it might be a pointer
+    if idaapi.inf_is_64bit() if hasattr(idaapi, "inf_is_64bit") else False:
+        ptr = int.from_bytes(data[:8], "little")
+    else:
+        ptr = int.from_bytes(data[:4], "little")
+    ptr_name = ida_name.get_name(ptr) if ptr else ""
+    if ptr_name:
+        result["as_pointer"] = {"address": hex(ptr), "name": ptr_name}
+
+    return result
+
+
+# ============================================================================
+# Enhanced Cross-Reference Query
+# ============================================================================
+
+
+@tool
+def xref_query(
+    address: Annotated[str, "Target address (hex) or name"],
+    direction: Annotated[
+        str, "Direction: 'to' (references TO this address) or 'from' (references FROM)"
+    ] = "to",
+    xref_type: Annotated[
+        str,
+        "Filter by type: 'call', 'data', 'jump', or '' for all",
+    ] = "",
+    offset: Annotated[int, "Starting index for pagination"] = 0,
+    count: Annotated[int, "Maximum results (default 50)"] = 50,
+) -> dict:
+    """Generic cross-reference query with direction, type filtering, and pagination. More flexible than get_xrefs_to/get_xrefs_from."""
+    import idautils
+    import idaapi
+    import ida_funcs
+    import ida_xref
+
+    ea = _resolve_address(address)
+
+    TYPE_FILTER = {
+        "call": {ida_xref.fl_CN, ida_xref.fl_CF},
+        "jump": {ida_xref.fl_JN, ida_xref.fl_JF},
+        "data": {ida_xref.dr_O, ida_xref.dr_W, ida_xref.dr_R},
+    }
+    allowed_types = TYPE_FILTER.get(xref_type)
+
+    all_xrefs = []
+    xref_iter = idautils.XrefsTo(ea) if direction == "to" else idautils.XrefsFrom(ea)
+    for xref in xref_iter:
+        if xref.type == ida_xref.fl_F:
+            continue  # Skip flow xrefs
+        if allowed_types and xref.type not in allowed_types:
+            continue
+
+        ref_addr = xref.frm if direction == "to" else xref.to
+        fn = idaapi.get_func(ref_addr)
+        all_xrefs.append({
+            "address": hex(ref_addr),
+            "type": _xref_type_name(xref.type),
+            "function": ida_funcs.get_func_name(fn.start_ea) if fn else None,
+        })
+
+    total = len(all_xrefs)
+    page = all_xrefs[offset: offset + count]
+    return {
+        "target": hex(ea),
+        "direction": direction,
+        "xref_type_filter": xref_type or "all",
+        "xrefs": page,
+        "total": total,
+        "offset": offset,
+        "has_more": offset + count < total,
+    }
+
+
+# ============================================================================
+# Enhanced Script Execution
+# ============================================================================
+
+
+@tool
+def py_exec_file(
+    file_path: Annotated[str, "Absolute path to Python script file to execute"],
+) -> dict:
+    """Execute a Python script file in the IDA context. The script can use all IDA APIs. Stdout/stderr are captured."""
+    from pathlib import Path
+
+    path = Path(file_path)
+    if not path.exists():
+        return {"error": f"Script file not found: {file_path}"}
+
+    script = path.read_text(encoding="utf-8")
+
+    old_stdout = sys.stdout
+    old_stderr = sys.stderr
+    captured_out = io.StringIO()
+    captured_err = io.StringIO()
+    sys.stdout = captured_out
+    sys.stderr = captured_err
+
+    error = None
+    error_type = None
+    try:
+        exec_globals = {"__builtins__": __builtins__, "__file__": str(path)}
+        exec(script, exec_globals)
+    except Exception as e:
+        error_type = type(e).__name__
+        error = f"{error_type}: {e}"
+    finally:
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+
+    return {
+        "file": str(path),
+        "output": captured_out.getvalue(),
+        "errors": captured_err.getvalue(),
+        "error": error,
+        "error_type": error_type,
+    }
+
+
+# ============================================================================
+# Debug Info Loading
+# ============================================================================
+
+
+@tool
+def load_debug_info(
+    path: Annotated[
+        str,
+        "Path to debug symbol file (PDB, dSYM, DWARF). Empty to auto-detect.",
+    ] = "",
+) -> dict:
+    """Load external debug symbols (PDB, dSYM, DWARF) into the current database. Enhances type information and function names."""
+    import ida_dbg
+    import ida_auto
+    import idautils
+    import ida_funcs
+
+    func_count_before = sum(1 for _ in idautils.Functions())
+
+    try:
+        if path:
+            # Load from specific path
+            ok = ida_dbg.load_debugger_symbols(path) if hasattr(ida_dbg, "load_debugger_symbols") else False
+            if not ok:
+                # Try via auto-analysis with PDB
+                import ida_pdb
+
+                if hasattr(ida_pdb, "pdb_set_remote_path"):
+                    ida_pdb.pdb_set_remote_path(path)
+                ok = True
+        else:
+            # Auto-detect: trigger PDB/dSYM loading
+            ok = True
+
+        # Wait for analysis to settle
+        ida_auto.auto_wait()
+    except Exception as e:
+        return {"error": f"Failed to load debug info: {e}"}
+
+    func_count_after = sum(1 for _ in idautils.Functions())
+    new_named = 0
+    for func_ea in idautils.Functions():
+        name = ida_funcs.get_func_name(func_ea)
+        if name and not name.startswith("sub_"):
+            new_named += 1
+
+    return {
+        "success": True,
+        "path": path or "<auto-detect>",
+        "functions_before": func_count_before,
+        "functions_after": func_count_after,
+        "named_functions": new_named,
+    }
+
+
+# ============================================================================
 # Resolve & Comment Utilities
 # ============================================================================
 
@@ -2503,6 +3566,8 @@ def batch_rename(
         try:
             ea = _resolve_address(addr)
             ok = idaapi.set_name(ea, new_name, idaapi.SN_NOWARN | idaapi.SN_NOCHECK)
+            if ok:
+                _invalidate_decompiler_cache(ea)
             results.append({"address": hex(ea), "new_name": new_name, "success": bool(ok)})
         except Exception as e:
             results.append({"address": addr, "new_name": new_name, "success": False, "error": str(e)})
@@ -2514,6 +3579,21 @@ def batch_rename(
 # ============================================================================
 # Helpers (not exposed as tools)
 # ============================================================================
+
+
+def _invalidate_decompiler_cache(ea: int):
+    """Mark decompiler cache dirty so pseudocode is refreshed after modifications."""
+    try:
+        import ida_hexrays
+
+        if ida_hexrays.init_hexrays_plugin():
+            import idaapi
+
+            fn = idaapi.get_func(ea)
+            if fn:
+                ida_hexrays.mark_cfunc_dirty(fn.start_ea)
+    except Exception:
+        pass
 
 
 def _resolve_address(addr_or_name: str) -> int:

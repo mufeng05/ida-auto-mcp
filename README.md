@@ -22,7 +22,7 @@ This makes multi-file analysis (e.g., a program with multiple DLLs) painful. **I
 - **Fully Automatic** — AI agents call `open_binary("path/to/file.dll")` to start analysis, no human in the loop
 - **Multi-Binary Sessions** — Open multiple binaries simultaneously, switch between them freely
 - **Headless** — Uses `idalib` (IDA as a library), no GUI needed
-- **63 Analysis Tools** — Decompile, disassemble, xrefs, strings, imports, types, search, rename, patching, and more
+- **79 Analysis Tools** — Decompile, disassemble, xrefs, strings, imports, types, search, rename, patching, and more
 - **MCP Standard** — Works with Claude Desktop, Claude Code, and any MCP-compatible client
 - **Stdio + HTTP** — Stdio transport for MCP clients, HTTP for debugging
 
@@ -93,9 +93,9 @@ python -m ida_auto_mcp --transport http --port 8765
 python -m ida_auto_mcp -v
 ```
 
-### Tools (63 total)
+### Tools (79 total)
 
-#### Session Management
+#### Session & Server
 | Tool | Description |
 |------|-------------|
 | `open_binary` | Open a binary for analysis (auto-analysis included) |
@@ -103,6 +103,8 @@ python -m ida_auto_mcp -v
 | `switch_binary` | Switch active session |
 | `list_sessions` | List all open sessions |
 | `get_current_session` | Get active session info |
+| `server_health` | Health check (server status, session, Hex-Rays availability) |
+| `server_warmup` | Warm up IDA subsystems (Hex-Rays, caches) to reduce first-call latency |
 
 #### Database
 | Tool | Description |
@@ -147,6 +149,11 @@ python -m ida_auto_mcp -v
 |------|-------------|
 | `survey_binary` | One-call binary triage (metadata, top functions/strings, import categories) |
 | `analyze_function` | Comprehensive function analysis (pseudocode, strings, constants, callers, complexity) |
+| `func_profile` | Profile multiple functions with summary metrics (callers, callees, strings, blocks, complexity) |
+| `analyze_batch` | Per-function analysis with selectable sections (decompile/disasm/xrefs/strings/cfg) |
+| `analyze_component` | Analyze related functions as a group (internal call graph, shared data, external deps) |
+| `analyze_strings` | List strings with their cross-references combined |
+| `diff_before_after` | Apply rename/set_type/set_comment and see before/after decompilation diff |
 
 #### Types & Structs
 | Tool | Description |
@@ -156,12 +163,17 @@ python -m ida_auto_mcp -v
 | `list_local_types` | List all local types (structs, enums, typedefs) with filtering |
 | `declare_type` | Declare C type definition in local type library |
 | `apply_type` | Apply type to address (function, global, etc.) |
+| `enum_upsert` | Create or extend an enum type (idempotent) |
+| `type_query` | Advanced type library query with member inspection |
+| `type_inspect` | Inspect a named type in detail (size, kind, declaration, members) |
+| `xrefs_to_field` | Get cross-references to a specific struct field member |
 | `read_struct_at` | Read struct field values from memory at an address |
 | `get_stack_frame` | Get stack frame layout (locals, args) |
 | `declare_stack_var` | Create or rename a stack variable |
 | `delete_stack_var` | Delete a stack variable from a function frame |
 | `list_entrypoints` | List binary entry points |
 | `get_globals` | List global variables |
+| `infer_types` | Auto-infer and apply type at address (Hex-Rays/heuristic) |
 
 #### Search
 | Tool | Description |
@@ -171,6 +183,11 @@ python -m ida_auto_mcp -v
 | `find_immediate` | Search for immediate values in instructions |
 | `xrefs_to_string` | Find strings matching query and return xrefs to each |
 | `resolve_function` | Find functions by partial name match (fuzzy search) |
+
+#### Cross-Reference Query
+| Tool | Description |
+|------|-------------|
+| `xref_query` | Generic xref query with direction/type filtering and pagination |
 
 #### Code Definition
 | Tool | Description |
@@ -182,15 +199,20 @@ python -m ida_auto_mcp -v
 #### Modify
 | Tool | Description |
 |------|-------------|
-| `rename_address` | Rename function/address |
+| `rename_address` | Rename function/address (auto-invalidates decompiler cache) |
 | `set_comment` | Set disassembly comment |
-| `set_function_type` | Set function prototype |
+| `set_function_type` | Set function prototype (auto-invalidates decompiler cache) |
 | `patch_bytes` | Patch bytes at an address (binary patching) |
 | `patch_asm` | Assemble instruction and patch at address |
 | `append_comment` | Append comment without overwriting (auto-dedup) |
+
+#### Memory Reading
+| Tool | Description |
+|------|-------------|
 | `read_bytes` | Read raw bytes at address |
 | `get_string_at` | Read null-terminated string at address |
-| `infer_types` | Auto-infer and apply type at address (Hex-Rays/heuristic) |
+| `get_int` | Read typed integer (u8/i8/u16/i16/u32/i32/u64/i64) from memory |
+| `get_global_value` | Read global variable value with multiple interpretations |
 | `pseudocode_at` | Get decompiled pseudocode lines at a specific address |
 
 #### Batch Operations
@@ -205,6 +227,8 @@ python -m ida_auto_mcp -v
 | `int_convert` | Convert numbers between decimal/hex/binary/ASCII |
 | `export_function` | Export function as C header or full decompiled code |
 | `run_script` | Execute arbitrary IDAPython code |
+| `py_exec_file` | Execute a Python script file in IDA context |
+| `load_debug_info` | Load external debug symbols (PDB, dSYM, DWARF) |
 
 ### Multi-Binary Workflow Example
 
@@ -229,7 +253,7 @@ ida_auto_mcp/
 ├── mcp_server.py    # MCP protocol implementation (stdio + HTTP)
 ├── _registry.py     # Global McpServer instance + @tool decorator
 ├── session.py       # Multi-binary session management via idalib
-└── tools.py         # 63 IDA analysis tools
+└── tools.py         # 79 IDA analysis tools
 ```
 
 ### License
@@ -256,7 +280,7 @@ This project is for personal and educational use. Requires a valid IDA Pro licen
 - **全自动** — AI 直接调用 `open_binary("path/to/file.dll")` 即可开始分析，无需人工干预
 - **多文件会话** — 同时打开多个二进制文件，自由切换
 - **无需 GUI** — 使用 `idalib`（IDA 库模式），不需要打开 IDA 界面
-- **63 个分析工具** — 反编译、反汇编、交叉引用、字符串、导入表、类型系统、搜索、重命名、补丁等
+- **79 个分析工具** — 反编译、反汇编、交叉引用、字符串、导入表、类型系统、搜索、重命名、补丁等
 - **MCP 标准协议** — 支持 Claude Desktop、Claude Code 及所有 MCP 兼容客户端
 - **双传输模式** — stdio 模式用于 MCP 客户端，HTTP 模式用于调试
 
@@ -327,9 +351,9 @@ python -m ida_auto_mcp --transport http --port 8765
 python -m ida_auto_mcp -v
 ```
 
-### 工具列表（共 63 个）
+### 工具列表（共 79 个）
 
-#### 会话管理
+#### 会话与服务器
 | 工具 | 说明 |
 |------|------|
 | `open_binary` | 打开二进制文件进行分析（含自动分析） |
@@ -337,6 +361,8 @@ python -m ida_auto_mcp -v
 | `switch_binary` | 切换到其他会话 |
 | `list_sessions` | 列出所有打开的会话 |
 | `get_current_session` | 获取当前活跃会话信息 |
+| `server_health` | 健康检查（服务器状态、会话、Hex-Rays 可用性） |
+| `server_warmup` | 预热 IDA 子系统（Hex-Rays、缓存），减少首次调用延迟 |
 
 #### 数据库操作
 | 工具 | 说明 |
@@ -381,6 +407,11 @@ python -m ida_auto_mcp -v
 |------|------|
 | `survey_binary` | 一次调用完成二进制分类（元数据、Top 函数/字符串、导入分类） |
 | `analyze_function` | 函数综合分析（伪代码、字符串、常量、调用者、复杂度） |
+| `func_profile` | 批量函数概要分析（调用者/被调用者/字符串/基本块/复杂度计数） |
+| `analyze_batch` | 按需选择的综合函数分析（反编译/反汇编/交叉引用/字符串/CFG） |
+| `analyze_component` | 分析一组相关函数（内部调用图、共享数据、外部依赖） |
+| `analyze_strings` | 字符串+交叉引用联合查询 |
+| `diff_before_after` | 修改后立即查看反编译前后对比（重命名/改类型/加注释） |
 
 #### 类型与结构体
 | 工具 | 说明 |
@@ -390,12 +421,17 @@ python -m ida_auto_mcp -v
 | `list_local_types` | 列出所有本地类型（结构体、枚举、typedef）|
 | `declare_type` | 声明 C 类型定义到本地类型库 |
 | `apply_type` | 将类型应用到地址（函数、全局变量等） |
+| `enum_upsert` | 创建或扩展枚举类型（幂等操作） |
+| `type_query` | 高级类型库查询（支持成员检查） |
+| `type_inspect` | 按名称查看类型详情（大小/类型/声明/成员） |
+| `xrefs_to_field` | 获取结构体特定字段的交叉引用 |
 | `read_struct_at` | 在内存地址读取结构体字段值 |
 | `get_stack_frame` | 获取函数栈帧布局 |
 | `declare_stack_var` | 创建或重命名栈变量 |
 | `delete_stack_var` | 删除函数栈帧中的栈变量 |
 | `list_entrypoints` | 列出二进制入口点 |
 | `get_globals` | 列出全局变量 |
+| `infer_types` | 自动推断并应用地址处的类型（Hex-Rays/启发式） |
 
 #### 搜索
 | 工具 | 说明 |
@@ -405,6 +441,11 @@ python -m ida_auto_mcp -v
 | `find_immediate` | 搜索指令中的立即数值 |
 | `xrefs_to_string` | 查找匹配字符串及其交叉引用 |
 | `resolve_function` | 按名称模糊搜索函数 |
+
+#### 交叉引用查询
+| 工具 | 说明 |
+|------|------|
+| `xref_query` | 通用交叉引用查询（方向/类型过滤+分页） |
 
 #### 代码定义
 | 工具 | 说明 |
@@ -416,15 +457,20 @@ python -m ida_auto_mcp -v
 #### 修改
 | 工具 | 说明 |
 |------|------|
-| `rename_address` | 重命名函数/地址 |
+| `rename_address` | 重命名函数/地址（自动刷新反编译缓存） |
 | `set_comment` | 设置反汇编注释 |
-| `set_function_type` | 设置函数原型 |
+| `set_function_type` | 设置函数原型（自动刷新反编译缓存） |
 | `patch_bytes` | 在指定地址写入字节（二进制补丁） |
 | `patch_asm` | 汇编指令并写入到指定地址 |
 | `append_comment` | 追加注释（不覆盖已有注释，自动去重） |
+
+#### 内存读取
+| 工具 | 说明 |
+|------|------|
 | `read_bytes` | 读取指定地址的原始字节 |
 | `get_string_at` | 读取指定地址的以 null 结尾的字符串 |
-| `infer_types` | 自动推断并应用地址处的类型（Hex-Rays/启发式） |
+| `get_int` | 按类型读取整数值（u8/i8/u16/i16/u32/i32/u64/i64） |
+| `get_global_value` | 读取全局变量值（多种整数解释） |
 | `pseudocode_at` | 获取特定地址处的反编译伪代码行 |
 
 #### 批量操作
@@ -439,6 +485,8 @@ python -m ida_auto_mcp -v
 | `int_convert` | 十进制/十六进制/二进制/ASCII 之间的数值转换 |
 | `export_function` | 导出函数为 C 头文件或完整反编译代码 |
 | `run_script` | 执行 IDAPython 脚本 |
+| `py_exec_file` | 执行 Python 脚本文件 |
+| `load_debug_info` | 加载外部调试符号（PDB、dSYM、DWARF） |
 
 ### 多文件分析示例
 
@@ -463,7 +511,7 @@ ida_auto_mcp/
 ├── mcp_server.py    # MCP 协议实现（stdio + HTTP 传输）
 ├── _registry.py     # 全局 McpServer 实例 + @tool 装饰器
 ├── session.py       # 多文件会话管理（基于 idalib）
-└── tools.py         # 63 个 IDA 分析工具
+└── tools.py         # 79 个 IDA 分析工具
 ```
 
 ### 许可

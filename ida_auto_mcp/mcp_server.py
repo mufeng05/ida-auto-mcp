@@ -23,6 +23,9 @@ from types import UnionType
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
+MAX_OUTPUT_CHARS = 50_000
+
+
 class McpServer:
     """MCP server with stdio and HTTP transports."""
 
@@ -143,6 +146,13 @@ class McpServer:
         try:
             result = self._call_with_params(func, arguments or {})
             text = json.dumps(result, indent=2, ensure_ascii=False, default=str)
+            total_len = len(text)
+            if total_len > MAX_OUTPUT_CHARS:
+                text = (
+                    text[:MAX_OUTPUT_CHARS]
+                    + f"\n\n... [truncated: {total_len} chars total,"
+                    f" showing first {MAX_OUTPUT_CHARS}]"
+                )
             return {
                 "content": [{"type": "text", "text": text}],
                 "structuredContent": (
