@@ -45,6 +45,36 @@ pip install -e .
 
 ### Quick Start
 
+#### Codex (`~/.codex/config.toml`)
+
+Codex reads MCP server settings from `~/.codex/config.toml` (or from
+`.codex/config.toml` in a trusted project). Add:
+
+```toml
+[mcp_servers.ida-auto-mcp]
+command = "python"
+args = ["-m", "ida_auto_mcp"]
+startup_timeout_sec = 30
+tool_timeout_sec = 600
+
+[mcp_servers.ida-auto-mcp.env]
+IDADIR = "C:/Program Files/IDA Pro"
+```
+
+You can register the same server with the Codex CLI instead:
+
+```bash
+codex mcp add ida-auto-mcp --env "IDADIR=C:/Program Files/IDA Pro" -- python -m ida_auto_mcp
+codex mcp list
+```
+
+Replace the IDA path with the installation path on your machine. If Codex
+cannot find `python`, set `command` to the Python executable's absolute path,
+for example `C:/Python310/python.exe`. Start a new Codex session after changing
+the configuration; restart the desktop app or IDE extension when using those
+clients. See the [Codex MCP documentation](https://developers.openai.com/codex/mcp/)
+for additional configuration options.
+
 #### Claude Code (`~/.claude.json`)
 
 ```json
@@ -266,6 +296,34 @@ pip install -e .
 ```
 
 ### 快速开始
+
+#### Codex 配置 (`~/.codex/config.toml`)
+
+Codex 从 `~/.codex/config.toml` 读取 MCP 服务器配置；也可以在受信任的项目中使用
+项目级 `.codex/config.toml`。添加以下内容：
+
+```toml
+[mcp_servers.ida-auto-mcp]
+command = "python"
+args = ["-m", "ida_auto_mcp"]
+startup_timeout_sec = 30
+tool_timeout_sec = 600
+
+[mcp_servers.ida-auto-mcp.env]
+IDADIR = "C:/Program Files/IDA Pro"
+```
+
+也可以使用 Codex CLI 注册相同的服务器：
+
+```bash
+codex mcp add ida-auto-mcp --env "IDADIR=C:/Program Files/IDA Pro" -- python -m ida_auto_mcp
+codex mcp list
+```
+
+请将 IDA 路径替换为本机的实际安装路径。如果 Codex 找不到 `python`，请将
+`command` 改为 Python 可执行文件的绝对路径，例如 `C:/Python310/python.exe`。
+修改配置后请新建 Codex 会话；使用桌面应用或 IDE 扩展时，请重启对应客户端。
+更多配置选项请参阅 [Codex MCP 官方文档](https://developers.openai.com/codex/mcp/)。
 
 #### Claude Code 配置 (`~/.claude.json`)
 
