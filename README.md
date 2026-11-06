@@ -14,6 +14,23 @@ IDA Auto MCP is a small MCP server built directly on IDA's headless `idalib` lib
 
 It is not the only headless option: [ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp) also ships an idalib-based server with multi-binary support, and [ida-mcp-rs](https://github.com/blacktop/ida-mcp-rs) is a headless server written in Rust. IDA Auto MCP aims to stay small and easy to audit: a single Python process, no third-party dependencies besides IDA's own `idapro` package, and an implicit active session so tools don't take a database argument.
 
+### Compared with the Official IDA MCP Server
+
+Hex-Rays publishes an official [IDA MCP server](https://github.com/HexRaysSA/ida-mcp). Compared with its version 20261023.0.2 (built on ida-nexus 0.14.1):
+
+| | IDA Auto MCP | Official IDA MCP |
+|---|---|---|
+| While IDA is still analyzing | Every tool answers. IDA keeps analyzing in the background, and results report the progress (`analysis.complete`, the current stage) | `execute_python` runs only once the initial auto-analysis has finished, which for a large or obfuscated binary can take hours |
+| Without analysis | `open_binary(auto_analysis=false)` only loads the file: the tools work on it at once, and `wait_analysis` analyzes it when needed | Not possible in a headless worker: `open_database` has no option to skip analysis, and `execute_python` waits for it to finish |
+| How the agent works | 55 tools that each do one task (decompile, xrefs, strings, types, ...) and return structured results | The agent writes Python against the ida-domain API for every query, looking the API up with `reference` |
+| Permissions | Read-only by default: changing the database needs `--allow-write`, arbitrary code `--allow-script` | `execute_python` runs arbitrary Python; there is no read-only mode |
+| Tool annotations | Every tool is marked `readOnlyHint` or `destructiveHint` | Only `reference` and `list_databases` are marked (`readOnlyHint`) |
+| Untrusted samples | The server instructions tell the agent that strings, names and pseudocode are data, not instructions | No such guidance |
+| HTTP transport | Requires a bearer token | No built-in authentication (Host and Origin checks) |
+| Requirements | IDA 9.0+, Python 3.10+, nothing besides Hex-Rays' `idapro` | IDA 9.4+, Python 3.11+, Git and uv |
+
+The official server runs each database in its own IDA process. It can therefore keep several databases open at once, report an IDA crash without losing the connection, and attach to a database open in the IDA GUI. If you need those, it is the better fit.
+
 ### Key Features
 
 - **Fully Automatic** — AI agents call `open_binary("path/to/file.dll")` to start analysis, no human in the loop
@@ -26,6 +43,7 @@ It is not the only headless option: [ida-pro-mcp](https://github.com/mrexodia/id
 - **Careful with Databases** — Refuses a database that another IDA has open, and backs up what a crash left behind before IDA discards it
 - **Raw Firmware** — `open_binary` takes the processor, file type, base address and entry point of a raw blob
 - **MCP Standard** — Works with Claude Desktop, Claude Code, Codex, and any MCP client; tools carry MCP annotations (`readOnlyHint`, `destructiveHint`) and the server sends usage instructions
+- **Checked Arguments** — Tool arguments are checked against each tool's schema: a misspelled name is refused with a suggestion ("did you mean 'filter_str'?") instead of being ignored, and a wrong type gets a clear error the agent can correct
 - **Stdio + HTTP** — Stdio transport for MCP clients, token-protected HTTP for debugging
 
 ### Prerequisites
@@ -156,7 +174,7 @@ Or add it to `~/.claude.json` yourself:
 # Start server (stdio mode, default; read-only tools only)
 python -m ida_auto_mcp
 
-# Pre-load a binary on startup
+# Open a binary once the server has started (the first tool call waits for it)
 python -m ida_auto_mcp C:/samples/target.exe
 
 # Also enable the tools that modify the database, and run_script
@@ -341,7 +359,7 @@ ida_auto_mcp/
 └── tools.py         # 55 IDA analysis tools
 ```
 
-The tests need no IDA installation. They cover tool permissions, the HTTP checks, the protocol layer (version negotiation, annotations, time limits, cancellation, the trace, background work), `run_script`, the database file checks and loader options, and, with stand-ins for IDA's modules, the analysis steps, the caches they refresh and functions split into chunks:
+The tests need no IDA installation. They cover tool permissions, the HTTP checks, the protocol layer (version negotiation, annotations, argument checks, time limits, cancellation, the trace, background and deferred work), `run_script`, the database file checks and loader options, and, with stand-ins for IDA's modules, the analysis steps, the caches they refresh and functions split into chunks:
 
 ```bash
 python -m unittest discover -s tests -v
@@ -379,6 +397,23 @@ IDA Auto MCP 是直接基于 IDA 无头分析库 `idalib` 的小型 MCP 服务�
 
 它不是唯一的无头方案：[ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp) 同样提供基于 idalib、支持多文件的服务器，[ida-mcp-rs](https://github.com/blacktop/ida-mcp-rs) 是用 Rust 写的无头服务器。IDA Auto MCP 的目标是保持小巧、便于审计：单个 Python 进程，除 IDA 自带的 `idapro` 包外没有第三方依赖，并采用隐式的当前会话，调用工具时不需要传数据库参数。
 
+### 与官方 IDA MCP 的对比
+
+Hex-Rays 发布了官方的 [IDA MCP 服务器](https://github.com/HexRaysSA/ida-mcp)。与它的 20261023.0.2 版（基于 ida-nexus 0.14.1）相比：
+
+| | IDA Auto MCP | 官方 IDA MCP |
+|---|---|---|
+| IDA 仍在分析时 | 所有工具都能用。IDA 在后台继续分析，结果中会报告进度（`analysis.complete`、当前阶段） | `execute_python` 要等初始自动分析结束才执行，大型或混淆过的程序可能要等几个小时 |
+| 不分析直接用 | `open_binary(auto_analysis=false)` 只加载文件：工具立刻就能用，需要时再用 `wait_analysis` 分析 | 无头模式下做不到：`open_database` 没有跳过分析的选项，`execute_python` 也会先等分析结束 |
+| 智能体怎么用 | 55 个各管一件事的工具（反编译、交叉引用、字符串、类型等），返回结构化结果 | 每次查询都由智能体基于 ida-domain API 编写 Python，并用 `reference` 查接口 |
+| 权限 | 默认只读：修改数据库需要 `--allow-write`，执行任意代码需要 `--allow-script` | `execute_python` 执行任意 Python，没有只读模式 |
+| 工具标注 | 每个工具都标有 `readOnlyHint` 或 `destructiveHint` | 只有 `reference` 和 `list_databases` 标了 `readOnlyHint` |
+| 不可信样本 | 服务器说明会提醒智能体：字符串、名称和伪代码是数据，不是指令 | 没有相关提示 |
+| HTTP 传输 | 需要 Bearer 令牌 | 没有内置认证（只检查 Host 和 Origin） |
+| 运行要求 | IDA 9.0+、Python 3.10+，除 Hex-Rays 的 `idapro` 外没有其他依赖 | IDA 9.4+、Python 3.11+，以及 Git 和 uv |
+
+官方服务器把每个数据库放在单独的 IDA 进程中运行，因此可以同时打开多个数据库，IDA 崩溃时能报告错误而不断开连接，还能连接 IDA 界面中已打开的数据库。如果需要这些能力，官方服务器更合适。
+
 ### 核心特性
 
 - **全自动** — AI 直接调用 `open_binary("path/to/file.dll")` 即可开始分析，无需人工干预
@@ -391,6 +426,7 @@ IDA Auto MCP 是直接基于 IDA 无头分析库 `idalib` 的小型 MCP 服务�
 - **谨慎对待数据库** — 拒绝打开正被其他 IDA 使用的数据库；IDA 丢弃崩溃残留文件之前先做备份
 - **原始固件** — `open_binary` 可以指定原始数据块的处理器、文件类型、基址和入口点
 - **MCP 标准协议** — 支持 Claude Desktop、Claude Code、Codex 及所有 MCP 客户端；工具带有 MCP 标注（`readOnlyHint`、`destructiveHint`），服务器会下发使用说明
+- **参数校验** — 工具参数会按各工具的 schema 校验：参数名写错时会被拒绝，并提示最接近的名字（"did you mean 'filter_str'?"），而不是被悄悄忽略；类型不对时返回清楚的错误，智能体可以据此改正
 - **双传输模式** — stdio 模式用于 MCP 客户端，带令牌认证的 HTTP 模式用于调试
 
 ### 前置要求
@@ -515,7 +551,7 @@ claude mcp add ida -e "IDADIR=C:/Program Files/IDA Pro" -- uvx ida-auto-mcp
 # 启动服务器（stdio 模式，默认；只提供只读工具）
 python -m ida_auto_mcp
 
-# 启动时预加载一个文件
+# 服务器启动后再打开一个文件（第一次工具调用会等它加载完）
 python -m ida_auto_mcp C:/samples/target.exe
 
 # 同时开启修改数据库的工具和 run_script
@@ -700,7 +736,7 @@ ida_auto_mcp/
 └── tools.py         # 55 个 IDA 分析工具
 ```
 
-测试不需要安装 IDA，覆盖工具权限、HTTP 检查、协议层（版本协商、标注、超时、取消、调用记录、后台任务）、`run_script`、数据库文件检查和加载选项，并用 IDA 模块的替身测试分析步骤、随之刷新的缓存以及拆成多块的函数：
+测试不需要安装 IDA，覆盖工具权限、HTTP 检查、协议层（版本协商、标注、参数校验、超时、取消、调用记录、后台任务和延后执行的任务）、`run_script`、数据库文件检查和加载选项，并用 IDA 模块的替身测试分析步骤、随之刷新的缓存以及拆成多块的函数：
 
 ```bash
 python -m unittest discover -s tests -v
