@@ -1,7 +1,7 @@
 {
   "name": "ida-auto-mcp",
   "displayName": "IDA Auto MCP",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "Headless IDA Pro analysis: decompile, disassemble, xrefs, strings, imports and types. Read-only tools only.",
   "author": {
     "name": "mufeng05",
