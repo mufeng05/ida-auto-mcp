@@ -52,7 +52,10 @@ def main():
         "input_path",
         nargs="?",
         type=Path,
-        help="Binary file to open on startup (optional, can also use open_binary tool)",
+        help=(
+            "Binary file to open once the server has started (optional, can "
+            "also use open_binary tool)"
+        ),
     )
     parser.add_argument(
         "--transport",
@@ -189,22 +192,22 @@ def main():
                 f"Error: File not found: {args.input_path}", file=sys.stderr
             )
             sys.exit(1)
+        input_path = args.input_path
 
-        manager = get_manager()
-        try:
-            # Only load it: the client is waiting for the server to start,
-            # and analysis continues in the background once it has
-            session = manager.open_binary(args.input_path, wait_seconds=0)
-            logging.info(
-                "Opened: %s (session: %s)",
-                args.input_path.name,
-                session.session_id,
-            )
-        except Exception as e:
-            print(
-                f"Error opening {args.input_path}: {e}", file=sys.stderr
-            )
-            sys.exit(1)
+        def open_input_binary():
+            # Only load it; analysis then continues in the background
+            try:
+                session = get_manager().open_binary(input_path, wait_seconds=0)
+                logging.info(
+                    "Opened: %s (session: %s)", input_path.name, session.session_id
+                )
+            except Exception as e:
+                print(f"Error opening {input_path}: {e}", file=sys.stderr)
+
+        # Loaded once the server answers: a large binary takes longer to
+        # load than clients wait for a server to start. A tool call that
+        # comes first waits for it.
+        mcp.defer(open_input_binary)
 
     # Cleanup on exit
     def cleanup(signum=None, frame=None):

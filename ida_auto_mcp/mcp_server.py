@@ -8,10 +8,12 @@ Copyright (c) 2025 Duncan Ogilvie, MIT License. See THIRD_PARTY_NOTICES.md.
 """
 
 import ctypes
+import difflib
 import hmac
 import ipaddress
 import json
 import logging
+import math
 import queue
 import secrets
 import select
@@ -42,6 +44,10 @@ MAX_HTTP_BODY = 16 * 1024 * 1024
 
 # Longest stretch of idle work between two checks for HTTP shutdown
 _HTTP_IDLE_SECONDS = 0.5
+
+# Deferred work waits for this long without messages, so that it starts
+# after the client's startup exchange (initialize, tools/list, ...)
+_DEFER_QUIET_SECONDS = 1.0
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +127,86 @@ def _tool_title(name: str) -> str:
     return name.replace("_", " ").capitalize()
 
 
+_TYPE_WORDS = {
+    "string": "a string",
+    "integer": "an integer",
+    "number": "a number",
+    "boolean": "true or false",
+    "array": "an array",
+    "object": "an object",
+    "null": "null",
+}
+
+
+def _conform(value: Any, schema: dict) -> tuple[bool, Any]:
+    """Whether value matches a parameter's JSON schema, and the value to pass:
+    an integral number such as 5.0 becomes 5 for an integer parameter."""
+    if "anyOf" in schema:
+        for option in schema["anyOf"]:
+            ok, converted = _conform(value, option)
+            if ok:
+                return True, converted
+        return False, value
+    kind = schema.get("type")
+    if kind in ("integer", "number"):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False, value
+        if isinstance(value, float) and not math.isfinite(value):
+            return False, value
+        if kind == "number":
+            return True, value
+        if isinstance(value, float):
+            return value.is_integer(), int(value) if value.is_integer() else value
+        return True, value
+    if kind == "string":
+        return isinstance(value, str), value
+    if kind == "boolean":
+        return isinstance(value, bool), value
+    if kind == "null":
+        return value is None, value
+    if kind == "object":
+        return isinstance(value, dict), value
+    if kind == "array":
+        if not isinstance(value, list):
+            return False, value
+        items = schema.get("items")
+        if not items:
+            return True, value
+        converted = []
+        for item in value:
+            ok, item = _conform(item, items)
+            if not ok:
+                return False, value
+            converted.append(item)
+        return True, converted
+    return True, value
+
+
+def _describe_schema(schema: dict) -> str:
+    """What a parameter accepts, e.g. "an integer"."""
+    if "anyOf" in schema:
+        return " or ".join(_describe_schema(option) for option in schema["anyOf"])
+    return _TYPE_WORDS.get(schema.get("type"), "a valid value")
+
+
+def _describe_value(value: Any) -> str:
+    """A JSON value as error messages show it, e.g. the string "5"."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        text = value if len(value) <= 40 else value[:37] + "..."
+        return "the string " + json.dumps(text, ensure_ascii=False)
+    if isinstance(value, (int, float)):
+        return f"the number {value!r}"
+    if isinstance(value, list):
+        return "an array"
+    if isinstance(value, dict):
+        return "an object"
+    return type(value).__name__
+
+
 class McpServer:
     """MCP server with stdio and HTTP transports."""
 
@@ -157,6 +243,12 @@ class McpServer:
         self.idle_task: Callable[[], bool] | None = None
         # Set when idle_task raised; it is retried after the next message
         self._idle_failed = False
+        # Work for when the server runs (see defer()), and when the last
+        # message was handled (None before the first)
+        self._deferred: list[Callable[[], None]] = []
+        self._last_message_at: float | None = None
+        # Each tool's input schema, as tools/list advertises it
+        self._input_schemas: dict[str, dict] = {}
 
         self._handlers: dict[str, Callable] = {
             "initialize": self._handle_initialize,
@@ -198,6 +290,23 @@ class McpServer:
         """Whether a registered tool may be listed and called."""
         group = self._tool_groups.get(name)
         return group is None or group in self.enabled_groups
+
+    def defer(self, task: Callable[[], None]) -> None:
+        """Run task once the server is serving, on the thread that handles
+        requests: when no message has come for _DEFER_QUIET_SECONDS since
+        the client's first one (its initialize), or before the next tool
+        call, whichever comes first. For slow startup work, such as loading a
+        large binary, that would otherwise outlast the time clients give a
+        server to start. Its exceptions are logged."""
+        self._deferred.append(task)
+
+    def _run_deferred(self) -> None:
+        while self._deferred:
+            task = self._deferred.pop(0)
+            try:
+                task()
+            except Exception:
+                logger.warning("Deferred startup work failed", exc_info=True)
 
     def dispatch(self, request: bytes | str | dict) -> dict | None:
         """Dispatch a JSON-RPC 2.0 request and return response or None for notifications."""
@@ -309,6 +418,7 @@ class McpServer:
         }
 
     def _handle_tools_call(self, name: str, arguments: dict | None = None, **kw):
+        self._run_deferred()
         func = self._tools.get(name)
         if func is None:
             return {
@@ -330,8 +440,12 @@ class McpServer:
                 "isError": True,
             }
         started = time.monotonic()
+        call_arguments, problem = self._check_arguments(name, func, arguments)
+        if problem is not None:
+            self._trace_call(name, arguments, started, problem)
+            return {"content": [{"type": "text", "text": problem}], "isError": True}
         try:
-            result, interrupted = self._run_tool(name, func, arguments or {})
+            result, interrupted = self._run_tool(name, func, call_arguments)
         except Exception as e:
             self._trace_call(name, arguments, started, f"{type(e).__name__}: {e}")
             return {
@@ -365,6 +479,60 @@ class McpServer:
             ),
             "isError": error is not None,
         }
+
+    def _input_schema(self, name: str, func: Callable) -> dict:
+        """A tool's input schema, as tools/list advertises it."""
+        schema = self._input_schemas.get(name)
+        if schema is None:
+            schema = self._build_tool_schema(name, func)["inputSchema"]
+            self._input_schemas[name] = schema
+        return schema
+
+    def _check_arguments(self, name: str, func: Callable, arguments: Any) -> tuple:
+        """Check a tool call's arguments against the tool's input schema.
+
+        Returns (arguments to call it with, None), or ({}, a message for the
+        model). Unknown names are refused rather than ignored, as a mistyped
+        name would quietly change what the tool does; names starting with "_"
+        (client metadata such as _meta) are dropped. As MCP 2025-11-25 asks,
+        the caller reports a refusal as a tool error the model can correct.
+        """
+        if arguments is None:
+            arguments = {}
+        if not isinstance(arguments, dict):
+            return {}, (
+                f"Invalid arguments for {name}: expected an object, not "
+                f"{_describe_value(arguments)}."
+            )
+        schema = self._input_schema(name, func)
+        properties = schema.get("properties", {})
+        checked = {}
+        problems = []
+        for key, value in arguments.items():
+            if key not in properties:
+                if not key.startswith("_"):
+                    close = difflib.get_close_matches(key, list(properties), n=1)
+                    hint = f" (did you mean '{close[0]}'?)" if close else ""
+                    problems.append(f"unknown argument '{key}'{hint}")
+                continue
+            ok, converted = _conform(value, properties[key])
+            if ok:
+                checked[key] = converted
+            else:
+                problems.append(
+                    f"'{key}' must be {_describe_schema(properties[key])}, "
+                    f"not {_describe_value(value)}"
+                )
+        missing = [key for key in schema.get("required", []) if key not in arguments]
+        if missing:
+            problems.append("missing " + ", ".join(f"'{key}'" for key in missing))
+        if problems:
+            names = ", ".join(properties) or "none"
+            return {}, (
+                f"Invalid arguments for {name}: {'; '.join(problems)}. "
+                f"Its arguments: {names}."
+            )
+        return checked, None
 
     def _run_tool(self, name: str, func: Callable, arguments: dict) -> tuple:
         """Call a tool, stopping it on timeout or client cancellation.
@@ -614,7 +782,14 @@ class McpServer:
                 break
 
     def _run_idle_task(self) -> bool:
-        """Run one slice of idle_task; returns whether more work remains."""
+        """Run deferred work once it is due, then one slice of idle_task;
+        returns whether more work remains."""
+        if (
+            self._deferred
+            and self._last_message_at is not None
+            and time.monotonic() - self._last_message_at >= _DEFER_QUIET_SECONDS
+        ):
+            self._run_deferred()
         if self.idle_task is None or self._idle_failed:
             return False
         try:
@@ -642,6 +817,8 @@ class McpServer:
                     "id": None,
                 }
             ).encode("utf-8")
+        finally:
+            self._last_message_at = time.monotonic()
 
     def serve(
         self, host: str = "127.0.0.1", port: int = 8765, token: str | None = None
