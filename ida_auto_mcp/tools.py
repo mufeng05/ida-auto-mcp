@@ -19,11 +19,12 @@ import json
 import linecache
 import re
 import sys
+import time
 import traceback
 from pathlib import Path
 from typing import Annotated, Optional
 
-from . import idb_files
+from . import analysis, idb_files
 from ._registry import mcp, script_tool, session_tool, tool, write_tool
 from .mcp_server import ToolInterrupted
 from .session import LoadOptions, get_manager
@@ -37,7 +38,11 @@ from .session import LoadOptions, get_manager
 @session_tool
 def open_binary(
     input_path: Annotated[str, "Absolute path to the binary file to analyze"],
-    auto_analysis: Annotated[bool, "Run IDA auto-analysis (recommended)"] = True,
+    auto_analysis: Annotated[
+        bool,
+        "Run IDA auto-analysis, in the background once this returns "
+        "(recommended); false analyzes nothing until wait_analysis",
+    ] = True,
     processor: Annotated[
         str, "Raw blobs: IDA processor module, e.g. 'arm', 'mipsl' (empty = detect)"
     ] = "",
@@ -49,7 +54,11 @@ def open_binary(
     ] = "",
     entry_point: Annotated[str, "Raw blobs: entry point address, e.g. '0x8000100'"] = "",
 ) -> dict:
-    """Open a binary file for analysis. Creates a new IDA session or reuses an existing one for the same file. This is the first tool you should call to start analyzing a binary. The loader options (processor, file_type, base_address, entry_point) apply only when IDA creates the file's database, such as for raw firmware."""
+    """Open a binary file for analysis. Creates a new IDA session or reuses an existing one for the same file. This is the first tool you should call to start analyzing a binary.
+
+    IDA's auto-analysis finds functions, cross-references and types. This tool waits for it up to a time set by the server (30 seconds by default), and analysis continues in the background between tool calls, so a binary whose analysis takes hours can be queried right away. Until `analysis.complete` is true, function lists, xrefs and pseudocode can be incomplete and may change; call wait_analysis when you need the finished analysis.
+
+    The loader options (processor, file_type, base_address, entry_point) apply only when IDA creates the file's database, such as for raw firmware."""
     try:
         options = LoadOptions(
             processor=processor.strip(),
@@ -62,10 +71,20 @@ def open_binary(
         session = get_manager().open_binary(
             path, auto_analysis=auto_analysis, options=options
         )
+        status = analysis.status()
+        message = f"Opened {session.input_path.name} (session: {session.session_id})."
+        if not status["complete"]:
+            message += (
+                " IDA is still analyzing it in the background: results can be "
+                "incomplete until analysis.complete is true."
+                if auto_analysis
+                else " It is not analyzed: call wait_analysis to analyze it."
+            )
         result = {
             "success": True,
-            "session": session.to_dict(),
-            "message": f"Opened {session.input_path.name} (session: {session.session_id})",
+            "session": session.to_dict(active=True),
+            "analysis": status,
+            "message": message,
         }
         if options and has_database:
             result["warning"] = (
@@ -96,7 +115,7 @@ def switch_binary(
         session = get_manager().switch_session(session_id)
         return {
             "success": True,
-            "session": session.to_dict(),
+            "session": session.to_dict(active=True),
             "message": f"Switched to {session.input_path.name}",
         }
     except Exception as e:
@@ -116,7 +135,7 @@ def get_current_session() -> dict:
     session = get_manager().get_current()
     if session is None:
         return {"error": "No active session. Use open_binary() to open a file first."}
-    return {"is_active": True, **session.to_dict()}
+    return {"is_active": True, **session.to_dict(active=True)}
 
 
 # ============================================================================
@@ -128,12 +147,13 @@ def get_current_session() -> dict:
 def get_database_info() -> dict:
     """Get metadata about the currently loaded binary (filename, architecture, image base, hashes, etc.)."""
     import idaapi
+    import ida_funcs
     import ida_nalt
     import idc
-    import ida_auto
     import idautils
 
     info = idaapi.get_inf_structure() if hasattr(idaapi, "get_inf_structure") else None
+    status = analysis.status()
 
     result = {
         "filename": ida_nalt.get_root_filename(),
@@ -141,7 +161,8 @@ def get_database_info() -> dict:
         "idb_path": idc.get_idb_path(),
         "imagebase": hex(idaapi.get_imagebase()),
         "processor": idaapi.get_idp_name(),
-        "auto_analysis_done": bool(ida_auto.auto_is_ok()),
+        "auto_analysis_done": status["complete"],
+        "analysis": status,
     }
 
     # Determine bitness
@@ -176,19 +197,57 @@ def get_database_info() -> dict:
         result["min_address"] = hex(min_ea)
         result["max_address"] = hex(max_ea)
 
-    # Function count
-    result["function_count"] = sum(1 for _ in idautils.Functions())
+    result["function_count"] = ida_funcs.get_func_qty()
 
     return result
 
 
-@tool(interruptible=False)
-def wait_analysis() -> dict:
-    """Wait for IDA auto-analysis to complete. Call this after open_binary if you want to ensure analysis is finished."""
-    import ida_auto
+@tool
+def wait_analysis(
+    timeout: Annotated[
+        float,
+        "Seconds to wait at most (default 60); 0 waits until analysis finishes, "
+        "within the server's time limit",
+    ] = 60,
+) -> dict:
+    """Run IDA's auto-analysis of the current binary until it finishes or `timeout` seconds pass, then report its progress. Analysis also continues in the background between tool calls, unless the binary was opened with auto_analysis=false (open it again with auto_analysis=true to change that). Call this when you need complete results: a large or obfuscated binary can take hours to analyze, so prefer a timeout and check `complete`."""
+    manager = get_manager()
+    if manager.get_current() is None:
+        return {"error": "No active session. Use open_binary() to open a file first."}
 
-    ida_auto.auto_wait()
-    return {"success": True, "message": "Auto-analysis completed"}
+    limit = timeout if timeout > 0 else None
+    if mcp.tool_timeout:
+        # Stop in time to report the progress, before the time limit stops the call
+        limit = min(limit or mcp.tool_timeout, mcp.tool_timeout * 0.9)
+    started = time.monotonic()
+    while True:
+        remaining = None if limit is None else limit - (time.monotonic() - started)
+        if remaining is not None and remaining <= 0:
+            break
+        if manager.advance_analysis(1.0 if remaining is None else min(remaining, 1.0)):
+            break
+
+    status = analysis.status()
+    result = {
+        "success": True,
+        "complete": status["complete"],
+        "waited_seconds": round(time.monotonic() - started, 1),
+        "analysis": status,
+    }
+    session = manager.get_current()
+    if status["complete"]:
+        pass
+    elif session is not None and session.analysis_stalled_at is not None:
+        result["message"] = (
+            "IDA has analysis queued that it does not process; results can "
+            "stay incomplete."
+        )
+    else:
+        result["message"] = (
+            "Analysis is not finished yet. Results can still be incomplete; "
+            "call wait_analysis again to wait longer."
+        )
+    return result
 
 
 @write_tool(interruptible=False)
@@ -327,17 +386,18 @@ def disassemble_function(
     address: Annotated[str, "Function address (hex) or name"],
     count: Annotated[int, "Max number of instructions (default 200)"] = 200,
 ) -> dict:
-    """Get assembly disassembly for a function or address range."""
+    """Get assembly disassembly for a function or address range. A function's instructions come chunk by chunk: the entry chunk first, then the parts of the function located elsewhere (listed in `chunks`)."""
     import idaapi
     import idc
-    import idautils
 
     ea = _resolve_address(address)
     fn = _get_func(ea)
 
     lines = []
+    chunks = None
     if fn:
-        for head in idautils.Heads(fn.start_ea, fn.end_ea):
+        chunks = _func_chunks(fn)
+        for head in _func_heads(fn):
             if len(lines) >= count:
                 break
             size = idc.get_item_size(head)
@@ -368,12 +428,15 @@ def disassemble_function(
             if current == idaapi.BADADDR:
                 break
 
-    return {
+    result = {
         "address": hex(ea),
         "is_function": fn is not None,
         "instructions": lines,
         "count": len(lines),
     }
+    if chunks is not None:
+        result["chunks"] = [{"start": hex(s), "end": hex(e)} for s, e in chunks]
+    return result
 
 
 # ============================================================================
@@ -448,23 +511,26 @@ def list_strings(
     count: Annotated[int, "Maximum results (default 100)"] = 100,
 ) -> dict:
     """List strings found in the binary with optional filtering. Strings marked synthetic (IDA 9.5+) exist only in the code, e.g. built from immediates, so their text is not stored at their address."""
-    import idautils
-
-    all_strings = []
-    for s in idautils.Strings():
-        if s is None:
-            continue
-        item = {"address": hex(s.ea), "text": str(s), "length": s.length}
-        if _is_synthetic_string(s):
-            item["synthetic"] = True
-        all_strings.append(item)
-
-    if filter_str:
+    offset = max(offset, 0)
+    count = max(count, 0)
+    size = _string_list_size()
+    if not filter_str:
+        page = [
+            _string_entry(s)
+            for s in _string_items(range(offset, min(offset + count, size)))
+        ]
+        total = size
+    else:
         pattern = filter_str.lower()
-        all_strings = [s for s in all_strings if pattern in s["text"].lower()]
-
-    total = len(all_strings)
-    page = all_strings[offset : offset + count]
+        page = []
+        total = 0
+        for s in _string_items(range(size)):
+            text = str(s)
+            if pattern not in text.lower():
+                continue
+            if offset <= total < offset + count:
+                page.append(_string_entry(s, text))
+            total += 1
     return {
         "strings": page,
         "total": total,
@@ -479,23 +545,85 @@ def search_strings(
     max_results: Annotated[int, "Maximum results (default 50)"] = 50,
 ) -> dict:
     """Search strings by regex pattern (case-insensitive)."""
-    import idautils
-
     compiled = re.compile(pattern, re.IGNORECASE)
     matches = []
-    for s in idautils.Strings():
-        if s is None:
-            continue
+    for s in _string_items(range(_string_list_size())):
+        if len(matches) >= max_results:
+            break
         text = str(s)
         if compiled.search(text):
             match = {"address": hex(s.ea), "text": text}
             if _is_synthetic_string(s):
                 match["synthetic"] = True
             matches.append(match)
-            if len(matches) >= max_results:
-                break
 
     return {"pattern": pattern, "matches": matches, "count": len(matches)}
+
+
+# IDA keeps the string list it built last. Building it scans the whole
+# database (seconds for a large binary), so it is kept for the database it was
+# built for, and refreshed after analysis changed the database: at once when
+# analysis has finished, at most once a minute while it is still running.
+_strlist_state: Optional[tuple] = None  # (generation, analysis epoch)
+_strlist_built_at = 0.0
+_STRLIST_REFRESH_SECONDS = 60.0
+
+
+def _string_list_size() -> int:
+    """Number of items in IDA's string list, after (re)building it if stale."""
+    import ida_strlist
+
+    global _strlist_state, _strlist_built_at
+    manager = get_manager()
+    state = (manager.generation, manager.analysis_epoch)
+    now = time.monotonic()
+    stale = (
+        _strlist_state is None
+        or _strlist_state[0] != state[0]
+        or (
+            _strlist_state[1] != state[1]
+            and (
+                analysis.is_complete()
+                or now - _strlist_built_at >= _STRLIST_REFRESH_SECONDS
+            )
+        )
+    )
+    if stale:
+        # As idautils.Strings() does: build with the options saved in the database
+        ida_strlist.get_strlist_options()
+        ida_strlist.build_strlist()
+        _strlist_state = state
+        _strlist_built_at = now
+    return ida_strlist.get_strlist_qty()
+
+
+def _string_items(indices):
+    """String list items (idautils.Strings.StringItem) at the given indices."""
+    import ida_strlist
+    import idautils
+
+    if hasattr(ida_strlist, "string_info_ex_t"):  # IDA 9.5+, with synthetic strings
+        info = ida_strlist.string_info_ex_t()
+        get_item = ida_strlist.get_strlist_item_ex
+    else:
+        info = ida_strlist.string_info_t()
+        get_item = ida_strlist.get_strlist_item
+    for index in indices:
+        if get_item(info, index):
+            # StringItem copies the fields, so info can be reused
+            yield idautils.Strings.StringItem(info)
+
+
+def _string_entry(s, text: Optional[str] = None) -> dict:
+    """A string list item as list_strings reports it."""
+    entry = {
+        "address": hex(s.ea),
+        "text": str(s) if text is None else text,
+        "length": s.length,
+    }
+    if _is_synthetic_string(s):
+        entry["synthetic"] = True
+    return entry
 
 
 # ============================================================================
@@ -841,7 +969,9 @@ def get_callees(
 
     callees = []
     seen = set()
-    for head in idautils.Heads(fn.start_ea, fn.end_ea):
+    for head in _func_heads(fn):
+        if len(callees) >= max_results:
+            break
         for xref in idautils.XrefsFrom(head):
             if len(callees) >= max_results:
                 break
@@ -900,7 +1030,7 @@ def get_callgraph(
         if not cur_fn:
             continue
 
-        for head in idautils.Heads(cur_fn.start_ea, cur_fn.end_ea):
+        for head in _func_heads(cur_fn):
             for xref in idautils.XrefsFrom(head):
                 if xref.type in (ida_xref.fl_CN, ida_xref.fl_CF):
                     target_fn = _get_func(xref.to)
@@ -1513,13 +1643,17 @@ def find_insns(
         fn = _get_func(ea)
         if not fn:
             return {"error": f"No function at {address}"}
-        ranges = [(fn.start_ea, fn.end_ea)]
+        ranges = _func_chunks(fn)
     else:
         ranges = []
+        seen = set()  # a tail can belong to several functions
         for func_ea in idautils.Functions():
             fn = _get_func(func_ea)
             if fn:
-                ranges.append((fn.start_ea, fn.end_ea))
+                for chunk in _func_chunks(fn):
+                    if chunk not in seen:
+                        seen.add(chunk)
+                        ranges.append(chunk)
 
     for start, end in ranges:
         if len(results) >= max_results:
@@ -2265,14 +2399,27 @@ def _invalidate_decompiler_cache(ea: int):
         pass
 
 
+# (database generation, analysis epoch) of the decompiler's cached results
+_decompiled_state: Optional[tuple] = None
+
+
 def _decompile(ea: int) -> tuple:
     """Decompile the function at ea: (cfunc, None), or (None, reason).
 
     Call init_hexrays_plugin() first. The tool time limit cannot interrupt
     the decompiler's native code, so on IDA 9.5+ the decompiler is given the
-    same limit and stops itself.
+    same limit and stops itself. Once analysis changed the database, the
+    decompiler's cached results are dropped: they may show functions as they
+    were before (cut short, missing calls).
     """
     import ida_hexrays
+
+    global _decompiled_state
+    manager = get_manager()
+    state = (manager.generation, manager.analysis_epoch)
+    if state != _decompiled_state:
+        ida_hexrays.clear_cached_cfuncs()
+        _decompiled_state = state
 
     if hasattr(ida_hexrays, "set_decompiler_timeout"):  # IDA 9.5+
         limit = mcp.tool_timeout
@@ -2298,6 +2445,35 @@ def _get_func(ea: int):
         fn = ida_funcs.func_entry_info_t()
         return fn if ida_funcs.get_func_entry_info(fn, ea) else None
     return ida_funcs.get_func(ea)
+
+
+def _func_chunks(fn) -> list:
+    """(start, end) of each chunk of a function from _get_func().
+
+    The entry chunk comes first, then the tails in address order: parts of
+    the function that IDA found elsewhere in the binary, common in optimized
+    and obfuscated code. start_ea/end_ea cover the entry chunk only.
+    """
+    import ida_funcs
+
+    if hasattr(ida_funcs, "get_func_tails"):  # IDA 9.5+
+        import ida_range
+
+        tails = ida_range.rangevec_t()
+        ida_funcs.get_func_tails(tails, fn.start_ea)
+        ranges = [(r.start_ea, r.end_ea) for r in tails]
+    else:
+        ranges = [(c.start_ea, c.end_ea) for c in ida_funcs.func_tail_iterator_t(fn)]
+    entry = (fn.start_ea, fn.end_ea)
+    return [entry] + sorted(r for r in set(ranges) if r[0] != fn.start_ea)
+
+
+def _func_heads(fn):
+    """Addresses of the items of a function from _get_func(), in all its chunks."""
+    import idautils
+
+    for start, end in _func_chunks(fn):
+        yield from idautils.Heads(start, end)
 
 
 def _flow_chart(func_ea: int):

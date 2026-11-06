@@ -11,8 +11,10 @@ import ctypes
 import hmac
 import ipaddress
 import json
+import logging
 import queue
 import secrets
+import select
 import socket
 import sys
 import threading
@@ -37,6 +39,11 @@ from urllib.parse import urlsplit
 
 # Largest request body the HTTP transport accepts
 MAX_HTTP_BODY = 16 * 1024 * 1024
+
+# Longest stretch of idle work between two checks for HTTP shutdown
+_HTTP_IDLE_SECONDS = 0.5
+
+logger = logging.getLogger(__name__)
 
 # MCP revisions this server speaks, newest first
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
@@ -144,6 +151,12 @@ class McpServer:
         self._active_lock = threading.Lock()
         self._active_request_id: Any = None
         self._active_run: _ToolRun | None = None
+        # Background work run while no request waits, such as IDA analysis:
+        # does a short slice and returns whether more remains. It runs on the
+        # thread that handles requests, never during one.
+        self.idle_task: Callable[[], bool] | None = None
+        # Set when idle_task raised; it is retried after the next message
+        self._idle_failed = False
 
         self._handlers: dict[str, Callable] = {
             "initialize": self._handle_initialize,
@@ -554,7 +567,8 @@ class McpServer:
 
         A reader thread keeps receiving while a tool runs, so that a client's
         notifications/cancelled can interrupt the tool in progress. Messages
-        are still handled one at a time, in order.
+        are still handled one at a time, in order. While none is waiting,
+        idle_task runs slice after slice.
         """
         stdin = stdin or sys.stdin.buffer
         stdout = stdout or sys.stdout.buffer
@@ -578,12 +592,15 @@ class McpServer:
                 messages.put(None)  # end of input
 
         threading.Thread(target=read_messages, name="mcp-stdin", daemon=True).start()
+        # Whether idle work may remain: then the queue is only polled
+        busy = True
         while True:
             try:
                 try:
                     # A timeout keeps the main thread responsive to signals
-                    line = messages.get(timeout=0.5)
+                    line = messages.get(timeout=0 if busy else 0.5)
                 except queue.Empty:
+                    busy = self._run_idle_task()
                     continue
                 if line is None:
                     break
@@ -591,12 +608,27 @@ class McpServer:
                 if data is not None:
                     stdout.write(data + b"\n")
                     stdout.flush()
+                # The request may have given the idle task new work
+                busy = True
             except (BrokenPipeError, KeyboardInterrupt, EOFError):
                 break
+
+    def _run_idle_task(self) -> bool:
+        """Run one slice of idle_task; returns whether more work remains."""
+        if self.idle_task is None or self._idle_failed:
+            return False
+        try:
+            return bool(self.idle_task())
+        except Exception:
+            # Retried after the next message, which may change what it does
+            self._idle_failed = True
+            logger.warning("Background work failed", exc_info=True)
+            return False
 
     def _respond(self, message: bytes) -> bytes | None:
         """Dispatch one message and serialize the reply. Never raises, so a
         single bad message can't stop either transport."""
+        self._idle_failed = False
         try:
             response = self.dispatch(message)
             if response is None:
@@ -635,7 +667,8 @@ class McpServer:
                 file=sys.stderr,
             )
         try:
-            server.serve_forever()
+            # A short poll interval, as idle work runs between two polls
+            server.serve_forever(poll_interval=0.05)
         except KeyboardInterrupt:
             pass
         finally:
@@ -715,6 +748,15 @@ class _McpHttpServer(HTTPServer):
     mcp: McpServer
     token: str
     bound_host: str
+
+    def service_actions(self):
+        """Run the server's idle work, called by serve_forever() between
+        requests: slice after slice until a connection waits, for at most
+        _HTTP_IDLE_SECONDS so that shutdown() is noticed."""
+        deadline = time.monotonic() + _HTTP_IDLE_SECONDS
+        while time.monotonic() < deadline and self.mcp._run_idle_task():
+            if select.select([self.socket], [], [], 0)[0]:
+                break
 
 
 class _McpHttpHandler(BaseHTTPRequestHandler):

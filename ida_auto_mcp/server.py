@@ -43,6 +43,7 @@ def main():
             "  python -m ida_auto_mcp /path/to/file.exe        # Open file on startup\n"
             "  python -m ida_auto_mcp --allow-write            # Allow renaming, comments, patching...\n"
             "  python -m ida_auto_mcp --timeout 600            # Stop tool calls after 10 minutes\n"
+            "  python -m ida_auto_mcp --analysis-wait 0        # open_binary returns once loaded\n"
             "  python -m ida_auto_mcp --transport http          # HTTP mode for debugging\n"
             "  python -m ida_auto_mcp --ida-dir /opt/ida        # Specify IDA installation\n"
         ),
@@ -98,8 +99,18 @@ def main():
             "Stop a tool call that runs longer than this (default: 300; 0 for "
             "no limit). A call busy inside one IDA function stops when that "
             "function returns; on IDA 9.5+ decompilation stops in time too. "
-            "Opening, switching, closing and saving databases and waiting for "
-            "analysis are never stopped."
+            "Opening, switching, closing and saving databases are never stopped."
+        ),
+    )
+    parser.add_argument(
+        "--analysis-wait",
+        type=float,
+        default=30,
+        metavar="SECONDS",
+        help=(
+            "How long open_binary waits for IDA's auto-analysis before it "
+            "returns (default: 30; 0 to return once the file is loaded). "
+            "Analysis then continues in the background between tool calls."
         ),
     )
     parser.add_argument(
@@ -167,6 +178,9 @@ def main():
         mcp.enabled_groups.add("script")
     mcp.tool_timeout = args.timeout if args.timeout > 0 else None
     mcp.trace_path = args.trace
+    get_manager().analysis_wait = max(args.analysis_wait, 0)
+    # Analyze the active database while no request is waiting
+    mcp.idle_task = get_manager().background_step
 
     # Open initial binary if specified
     if args.input_path:
@@ -178,7 +192,9 @@ def main():
 
         manager = get_manager()
         try:
-            session = manager.open_binary(args.input_path)
+            # Only load it: the client is waiting for the server to start,
+            # and analysis continues in the background once it has
+            session = manager.open_binary(args.input_path, wait_seconds=0)
             logging.info(
                 "Opened: %s (session: %s)",
                 args.input_path.name,

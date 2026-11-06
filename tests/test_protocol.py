@@ -235,6 +235,108 @@ class CancellationTests(unittest.TestCase):
         self.assertEqual(replies, [{"jsonrpc": "2.0", "result": {}, "id": 8}])
 
 
+class IdleTaskTests(unittest.TestCase):
+    """idle_task: background work (IDA analysis) between messages."""
+
+    def start(self, server: McpServer):
+        read_fd, write_fd = os.pipe()
+        self.stdin = os.fdopen(read_fd, "rb")
+        self.writer = os.fdopen(write_fd, "wb")
+        self.output = []
+        output = self.output
+
+        class Out:
+            def write(self, data):
+                output.append(data)
+
+            def flush(self):
+                pass
+
+        self.thread = threading.Thread(
+            target=server.stdio, args=(self.stdin, Out()), daemon=True
+        )
+        self.thread.start()
+
+    def ping(self, request_id) -> float:
+        """Send a ping; returns the seconds until its reply arrived."""
+        count = len(self.output)
+        started = time.monotonic()
+        message = {"jsonrpc": "2.0", "id": request_id, "method": "ping"}
+        self.writer.write(json.dumps(message).encode() + b"\n")
+        self.writer.flush()
+        while len(self.output) == count and time.monotonic() - started < 10:
+            time.sleep(0.005)
+        self.assertEqual(
+            json.loads(self.output[-1]), {"jsonrpc": "2.0", "result": {}, "id": request_id}
+        )
+        return time.monotonic() - started
+
+    def stop(self):
+        self.writer.close()
+        self.thread.join(timeout=10)
+        self.assertFalse(self.thread.is_alive())
+        self.stdin.close()
+
+    def wait_for(self, condition, seconds=5):
+        deadline = time.monotonic() + seconds
+        while not condition() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(condition())
+
+    def test_idle_task_runs_while_no_message_waits(self):
+        server = McpServer("test")
+        calls = []
+        server.idle_task = lambda: calls.append(1) or len(calls) < 5
+        self.start(server)
+        self.wait_for(lambda: len(calls) >= 5)
+        self.ping(1)
+        self.stop()
+
+    def test_requests_are_answered_while_idle_work_remains(self):
+        server = McpServer("test")
+
+        def endless_work():
+            time.sleep(0.01)
+            return True
+
+        server.idle_task = endless_work
+        self.start(server)
+        time.sleep(0.1)
+        for request_id in range(3):
+            self.assertLess(self.ping(request_id), 1)
+        # End of input still stops the server
+        self.stop()
+
+    def test_failing_idle_task_is_retried_after_the_next_message(self):
+        server = McpServer("test")
+        calls = []
+
+        def broken():
+            calls.append(1)
+            raise RuntimeError("broken")
+
+        server.idle_task = broken
+        with self.assertLogs("ida_auto_mcp.mcp_server", level="WARNING"):
+            self.start(server)
+            self.wait_for(lambda: len(calls) == 1)
+            time.sleep(0.6)
+            self.assertEqual(len(calls), 1)
+            self.ping(1)
+            self.wait_for(lambda: len(calls) == 2)
+            self.stop()
+
+    def test_http_server_runs_the_idle_task_between_requests(self):
+        server = McpServer("test")
+        calls = []
+        server.idle_task = lambda: calls.append(1) or len(calls) < 3
+        httpd = server.http_server("127.0.0.1", 0, "test-token-123")
+        try:
+            httpd.service_actions()
+        finally:
+            httpd.server_close()
+        self.assertEqual(len(calls), 3)
+
+
 class TraceTests(unittest.TestCase):
     def test_each_call_is_appended(self):
         server = McpServer("test")

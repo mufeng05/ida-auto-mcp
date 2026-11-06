@@ -3,9 +3,16 @@
 Each session represents an opened binary with its own IDA database.
 Only one database can be active at a time in idalib; switching
 sessions closes the current DB and reopens the target.
+
+IDA's auto-analysis runs in bounded steps (see analysis.py): open_binary
+waits for it up to analysis_wait seconds, and background_step() continues it
+while the server has no request to handle. Analysis that is still pending
+when a session is switched away from is saved with the database and resumes
+when the session becomes active again.
 """
 
 import re
+import time
 import uuid
 import logging
 from pathlib import Path
@@ -13,9 +20,12 @@ from typing import Optional
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from . import idb_files
+from . import analysis, idb_files
 
 logger = logging.getLogger(__name__)
+
+# Background analysis that could not go on is tried again after this long
+_STALLED_RETRY_SECONDS = 60.0
 
 
 @dataclass
@@ -25,17 +35,33 @@ class Session:
     session_id: str
     input_path: Path
     created_at: datetime = field(default_factory=datetime.now)
-    is_analyzing: bool = False
+    # Analyze in the background while this session is active
+    auto_analysis: bool = True
+    # Whether IDA's analysis queues were empty when last checked
+    analysis_complete: bool = False
+    # When analysis last stopped with work queued that IDA would not process
+    analysis_stalled_at: Optional[float] = None
     # Something the agent should know about how the database was opened
     note: Optional[str] = None
 
-    def to_dict(self) -> dict:
+    def analysis_state(self, active: bool) -> str:
+        """complete; running (in the background); paused (resumes when this
+        session is active again); or off (auto_analysis is false)."""
+        if self.analysis_complete:
+            return "complete"
+        if not self.auto_analysis:
+            return "off"
+        return "running" if active else "paused"
+
+    def to_dict(self, active: bool = False) -> dict:
+        state = self.analysis_state(active)
         result = {
             "session_id": self.session_id,
             "input_path": str(self.input_path),
             "filename": self.input_path.name,
             "created_at": self.created_at.isoformat(),
-            "is_analyzing": self.is_analyzing,
+            "analysis": state,
+            "is_analyzing": state == "running",
         }
         if self.note:
             result["note"] = self.note
@@ -112,6 +138,11 @@ class SessionManager:
         # Bumped whenever a database is opened or closed, so that state
         # holding IDA objects (run_script's variables) can be dropped
         self.generation = 0
+        # Bumped whenever analysis may have changed the open database, so
+        # that results derived from it (pseudocode, strings) are refreshed
+        self.analysis_epoch = 0
+        # Seconds open_binary waits for analysis before it returns
+        self.analysis_wait = 30.0
 
     def open_binary(
         self,
@@ -119,12 +150,17 @@ class SessionManager:
         auto_analysis: bool = True,
         session_id: str | None = None,
         options: Optional[LoadOptions] = None,
+        wait_seconds: Optional[float] = None,
     ) -> Session:
         """Open a binary file and create a new session.
 
-        If the file is already tracked, switches to it instead.
+        If the file is already tracked, switches to it instead. With
+        auto_analysis, waits up to wait_seconds (default: analysis_wait) for
+        IDA's analysis; the rest runs in background_step(). The flag also
+        applies to a tracked file, as the latest request for it.
         """
         path = Path(path).resolve()
+        wait = self.analysis_wait if wait_seconds is None else wait_seconds
 
         if not path.exists():
             raise FileNotFoundError(f"File not found: {path}")
@@ -134,6 +170,9 @@ class SessionManager:
             if session.input_path.resolve() == path:
                 logger.info("Binary already tracked in session %s, switching", sid)
                 self._activate(sid)
+                session.auto_analysis = auto_analysis
+                if auto_analysis and wait > 0:
+                    self.advance_analysis(wait)
                 return session
 
         if session_id is None:
@@ -142,7 +181,6 @@ class SessionManager:
             raise ValueError(f"Session ID already in use: {session_id}")
 
         import idapro
-        import ida_auto
 
         # Check before closing the current DB, so a refusal keeps it open
         note = self._check_database_files(path)
@@ -150,9 +188,9 @@ class SessionManager:
 
         logger.info("Opening database: %s (session: %s)", path.name, session_id)
         args = options.switches() if options else None
-        rc = idapro.open_database(
-            str(path), run_auto_analysis=auto_analysis, args=args or None
-        )
+        # Never let idalib analyze here: it would block until the whole
+        # analysis is done, which can take hours
+        rc = idapro.open_database(str(path), run_auto_analysis=False, args=args or None)
         self.generation += 1
         if rc:
             raise RuntimeError(
@@ -162,19 +200,66 @@ class SessionManager:
         session = Session(
             session_id=session_id,
             input_path=path,
-            is_analyzing=auto_analysis,
+            auto_analysis=auto_analysis,
+            analysis_complete=analysis.is_complete(),
             note=note,
         )
         self._sessions[session_id] = session
         self._active_id = session_id
 
-        if auto_analysis:
-            logger.info("Waiting for auto-analysis to complete...")
-            ida_auto.auto_wait()
-            session.is_analyzing = False
-            logger.info("Auto-analysis completed for %s", path.name)
-
+        if auto_analysis and wait > 0:
+            self.advance_analysis(wait)
         return session
+
+    def advance_analysis(self, seconds: float) -> bool:
+        """Advance the active database's analysis for about `seconds`.
+
+        Returns True once nothing is left to process.
+        """
+        session = self.get_current()
+        if session is None:
+            raise RuntimeError("No active session. Use open_binary() to open a file first.")
+        if analysis.is_complete():
+            session.analysis_complete = True
+            return True
+        # Bumped first: a step may change the database even if the call is
+        # interrupted before it returns
+        self.analysis_epoch += 1
+        session.analysis_complete = False
+        finished = analysis.advance(seconds)
+        if not finished:
+            session.analysis_stalled_at = None
+        elif analysis.is_complete():
+            session.analysis_complete = True
+            session.analysis_stalled_at = None
+            logger.info("Analysis of %s finished", session.input_path.name)
+        else:
+            if session.analysis_stalled_at is None:
+                logger.warning(
+                    "IDA does not process the analysis left for %s",
+                    session.input_path.name,
+                )
+            session.analysis_stalled_at = time.monotonic()
+        return finished
+
+    def background_step(self) -> bool:
+        """One slice of background analysis; returns whether more remains.
+
+        The server calls this whenever no request is waiting. It works on
+        the active session only, and only if that has auto_analysis. Tool
+        calls that queue more analysis (defining code, for example) make it
+        resume. Analysis that IDA would not continue is retried once a minute.
+        """
+        session = self.get_current()
+        if session is None or not session.auto_analysis:
+            return False
+        if analysis.is_complete():
+            session.analysis_complete = True
+            return False
+        stalled_at = session.analysis_stalled_at
+        if stalled_at is not None and time.monotonic() - stalled_at < _STALLED_RETRY_SECONDS:
+            return False
+        return not self.advance_analysis(analysis.SLICE_SECONDS)
 
     def close_session(self, session_id: str) -> bool:
         """Close a session. Returns True if found and closed."""
@@ -218,6 +303,8 @@ class SessionManager:
                 f"Failed to reopen database: {session.input_path} (error: {rc})"
             )
         self._active_id = session_id
+        # Analysis left pending was saved with the database and resumes
+        session.analysis_complete = analysis.is_complete()
         if note:
             session.note = note
         logger.info("Activated session %s (%s)", session_id, session.input_path.name)
@@ -260,7 +347,7 @@ class SessionManager:
     def list_sessions(self) -> list[dict]:
         """List all sessions with active status."""
         return [
-            {**s.to_dict(), "is_active": sid == self._active_id}
+            {**s.to_dict(active=sid == self._active_id), "is_active": sid == self._active_id}
             for sid, s in self._sessions.items()
         ]
 

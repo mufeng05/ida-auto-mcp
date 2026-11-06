@@ -18,6 +18,7 @@ It is not the only headless option: [ida-pro-mcp](https://github.com/mrexodia/id
 
 - **Fully Automatic** — AI agents call `open_binary("path/to/file.dll")` to start analysis, no human in the loop
 - **Multi-Binary Sessions** — Track several binaries as sessions and switch between them (only one database is open at a time; switching saves it and reopens the other one without re-running analysis)
+- **Background Analysis** — `open_binary` waits for IDA's auto-analysis for at most `--analysis-wait` seconds (30 by default) and the analysis continues between tool calls, so a binary that takes hours to analyze can be queried right away
 - **Headless** — Uses `idalib` (IDA as a library), no GUI needed
 - **55 Analysis Tools** — Decompile, disassemble, xrefs, strings, imports, types, search, rename, patching, and more
 - **Read-Only by Default** — Tools that modify the database or run arbitrary code are off until you enable them
@@ -167,6 +168,9 @@ python -m ida_auto_mcp --transport http --port 8765
 # Allow 10 minutes per tool call instead of 5, and log every call
 python -m ida_auto_mcp --timeout 600 --trace C:/temp/ida-auto-mcp.jsonl
 
+# open_binary returns as soon as the file is loaded; IDA analyzes it in the background
+python -m ida_auto_mcp --analysis-wait 0
+
 # Verbose logging
 python -m ida_auto_mcp -v
 ```
@@ -186,9 +190,17 @@ Keep both flags off while analyzing untrusted samples: strings and names inside 
 
 Each tool also carries MCP annotations: read-only tools are marked `readOnlyHint`, and the write tools and `run_script` are marked `destructiveHint`, so clients can tell them apart.
 
+### Background Analysis
+
+IDA's auto-analysis of a large or obfuscated binary can take hours, and idalib's own wait for it cannot be interrupted. The server therefore runs the analysis in small steps. `open_binary` waits for it for at most `--analysis-wait` seconds (30 by default; `0` returns as soon as the file is loaded). After that the server continues the analysis whenever no request is waiting, in slices of about 50 ms, so requests are answered between two slices. A rare step takes a few seconds and then delays the next request.
+
+Until the analysis is complete, function lists, cross-references and pseudocode can be incomplete and change as it progresses. `open_binary` and `get_database_info` report `analysis`: whether it is `complete`, its current `stage` and `address`, and the number of `functions` found so far. Sessions report `analysis` as `running`, `paused` (another session is active; it resumes when this one is again), `off` or `complete`. `wait_analysis(timeout)` waits for up to `timeout` seconds (60 by default, `0` until the analysis finishes) and reports the progress; it can be cancelled. With `auto_analysis=false`, nothing is analyzed until `wait_analysis` runs the analysis. Analysis that is still pending is saved with the database when you switch sessions.
+
+Results derived from the analysis follow it: once it has changed the database, functions are decompiled again instead of coming from the decompiler's cache. `list_strings` and `search_strings` keep IDA's string list between calls, since building it scans the whole database; the list is rebuilt at most once a minute while analysis runs, and once more when it finishes.
+
 ### Time Limits and Cancellation
 
-A tool call may run for `--timeout` seconds (300 by default, `0` for no limit). After that the server stops it and returns an error that suggests narrowing the request. When the client cancels a call over stdio (`notifications/cancelled`, for example when you interrupt the agent), the server stops it the same way and sends no result. Python code stops at once; a call busy inside one IDA function stops when that function returns. On IDA 9.5 and later the decompiler gets the same limit and stops by itself. Opening, switching, closing and saving databases and `wait_analysis` are never interrupted, so a database is never left half opened or half saved.
+A tool call may run for `--timeout` seconds (300 by default, `0` for no limit). After that the server stops it and returns an error that suggests narrowing the request. When the client cancels a call over stdio (`notifications/cancelled`, for example when you interrupt the agent), the server stops it the same way and sends no result. Python code stops at once; a call busy inside one IDA function stops when that function returns. On IDA 9.5 and later the decompiler gets the same limit and stops by itself. `wait_analysis` stops between two analysis steps, and ends a little before the time limit to report the progress. Opening, switching, closing and saving databases are never interrupted, so a database is never left half opened or half saved.
 
 `--trace FILE` appends one JSON line per tool call (tool, arguments, duration, error), which helps to see what an agent did and where the time went.
 
@@ -205,7 +217,7 @@ Tools marked *(write)* need `--allow-write`; *(script)* needs `--allow-script`.
 #### Session
 | Tool | Description |
 |------|-------------|
-| `open_binary` | Open a binary for analysis (auto-analysis included; loader options for raw firmware) |
+| `open_binary` | Open a binary for analysis (waits up to `--analysis-wait` seconds for auto-analysis, which then continues in the background; loader options for raw firmware) |
 | `close_binary` | Close a session |
 | `switch_binary` | Switch active session |
 | `list_sessions` | List all open sessions |
@@ -215,7 +227,7 @@ Tools marked *(write)* need `--allow-write`; *(script)* needs `--allow-script`.
 | Tool | Description |
 |------|-------------|
 | `get_database_info` | Binary metadata (filename, arch, imagebase, MD5, SHA256, file size) |
-| `wait_analysis` | Wait for auto-analysis to complete |
+| `wait_analysis` | Run auto-analysis until it finishes or a timeout passes, and report its progress |
 | `save_database` | Save IDA database to disk *(write)* |
 
 #### Analysis
@@ -324,11 +336,12 @@ ida_auto_mcp/
 ├── mcp_server.py    # MCP protocol implementation (stdio + HTTP), time limits
 ├── _registry.py     # Global McpServer instance + tool decorators
 ├── session.py       # Multi-binary session management via idalib
+├── analysis.py      # Runs IDA's auto-analysis in bounded steps
 ├── idb_files.py     # Checks a database's files before IDA opens it
 └── tools.py         # 55 IDA analysis tools
 ```
 
-The tests need no IDA installation. They cover tool permissions, the HTTP checks, the protocol layer (version negotiation, annotations, time limits, cancellation, the trace), `run_script`, the database file checks and loader options:
+The tests need no IDA installation. They cover tool permissions, the HTTP checks, the protocol layer (version negotiation, annotations, time limits, cancellation, the trace, background work), `run_script`, the database file checks and loader options, and, with stand-ins for IDA's modules, the analysis steps, the caches they refresh and functions split into chunks:
 
 ```bash
 python -m unittest discover -s tests -v
@@ -370,6 +383,7 @@ IDA Auto MCP 是直接基于 IDA 无头分析库 `idalib` 的小型 MCP 服务�
 
 - **全自动** — AI 直接调用 `open_binary("path/to/file.dll")` 即可开始分析，无需人工干预
 - **多文件会话** — 可将多个文件记录为会话并自由切换（同一时刻只打开一个数据库，切换时保存当前数据库并重新打开目标数据库，不会重新分析）
+- **后台分析** — `open_binary` 最多等待 IDA 自动分析 `--analysis-wait` 秒（默认 30 秒），之后分析在工具调用的间隙继续进行，分析要跑几个小时的程序也能马上开始查询
 - **无需 GUI** — 使用 `idalib`（IDA 库模式），不需要打开 IDA 界面
 - **55 个分析工具** — 反编译、反汇编、交叉引用、字符串、导入表、类型系统、搜索、重命名、补丁等
 - **默认只读** — 会修改数据库或执行任意代码的工具默认关闭，需要显式开启
@@ -513,6 +527,9 @@ python -m ida_auto_mcp --transport http --port 8765
 # 单次工具调用上限改为 10 分钟（默认 5 分钟），并记录每次调用
 python -m ida_auto_mcp --timeout 600 --trace C:/temp/ida-auto-mcp.jsonl
 
+# 文件加载完 open_binary 就返回，IDA 在后台分析
+python -m ida_auto_mcp --analysis-wait 0
+
 # 详细日志
 python -m ida_auto_mcp -v
 ```
@@ -532,9 +549,17 @@ python -m ida_auto_mcp -v
 
 每个工具还带有 MCP 标注：只读工具标记为 `readOnlyHint`，写入类工具和 `run_script` 标记为 `destructiveHint`，客户端可以据此区分它们。
 
+### 后台分析
+
+大型或经过混淆的程序，IDA 的自动分析可能要跑几个小时，而 idalib 自带的等待无法中断。因此服务器把分析拆成很小的步骤来执行。`open_binary` 最多等待分析 `--analysis-wait` 秒（默认 30；`0` 表示文件加载完就返回）。此后只要没有请求在等，服务器就以约 50 毫秒为一片继续推进分析，请求会在两片之间得到处理。个别步骤要花几秒，这时下一个请求要等它结束。
+
+分析完成之前，函数列表、交叉引用和伪代码可能不完整，并会随分析推进而变化。`open_binary` 和 `get_database_info` 会返回 `analysis`：是否已完成（`complete`）、当前阶段（`stage`）和地址（`address`），以及目前找到的函数数（`functions`）。会话信息里的 `analysis` 为 `running`（进行中）、`paused`（其他会话处于活跃状态，切回本会话后继续）、`off`（未开启）或 `complete`（已完成）。`wait_analysis(timeout)` 最多等待 `timeout` 秒（默认 60，`0` 表示等到分析结束）并报告进度，可以取消。传入 `auto_analysis=false` 时不做任何分析，直到调用 `wait_analysis`。切换会话时，尚未完成的分析会随数据库一起保存。
+
+由分析得出的结果会跟着分析更新：分析改动了数据库之后，函数会重新反编译，而不是沿用反编译器的缓存。`list_strings` 和 `search_strings` 会在多次调用之间复用 IDA 的字符串表，因为构建它要扫描整个数据库；分析进行期间最多每分钟重建一次，分析结束时再重建一次。
+
 ### 超时与取消
 
-单次工具调用最多运行 `--timeout` 秒（默认 300，`0` 表示不限制）。超时后服务器会停止该调用，并返回错误，提示缩小请求范围。客户端通过 stdio 取消调用时（`notifications/cancelled`，例如你中断了智能体），服务器同样会停止它，且不再返回结果。Python 代码会立即停下；正在执行某个 IDA 函数的调用，要等该函数返回后才停下。在 IDA 9.5 及以上版本中，反编译器也会使用同一上限并自行中止。打开、切换、关闭、保存数据库以及 `wait_analysis` 永远不会被中断，因此不会出现数据库只打开或保存了一半的情况。
+单次工具调用最多运行 `--timeout` 秒（默认 300，`0` 表示不限制）。超时后服务器会停止该调用，并返回错误，提示缩小请求范围。客户端通过 stdio 取消调用时（`notifications/cancelled`，例如你中断了智能体），服务器同样会停止它，且不再返回结果。Python 代码会立即停下；正在执行某个 IDA 函数的调用，要等该函数返回后才停下。在 IDA 9.5 及以上版本中，反编译器也会使用同一上限并自行中止。`wait_analysis` 会在两个分析步骤之间停下，并在到达上限前稍早结束，以便返回进度。打开、切换、关闭、保存数据库永远不会被中断，因此不会出现数据库只打开或保存了一半的情况。
 
 `--trace FILE` 会为每次工具调用追加一行 JSON（工具、参数、耗时、错误），便于查看智能体做了什么、时间花在哪里。
 
@@ -551,7 +576,7 @@ python -m ida_auto_mcp -v
 #### 会话管理
 | 工具 | 说明 |
 |------|------|
-| `open_binary` | 打开二进制文件进行分析（含自动分析；原始固件可指定加载选项） |
+| `open_binary` | 打开二进制文件进行分析（最多等待自动分析 `--analysis-wait` 秒，之后在后台继续；原始固件可指定加载选项） |
 | `close_binary` | 关闭分析会话 |
 | `switch_binary` | 切换到其他会话 |
 | `list_sessions` | 列出所有打开的会话 |
@@ -561,7 +586,7 @@ python -m ida_auto_mcp -v
 | 工具 | 说明 |
 |------|------|
 | `get_database_info` | 获取二进制文件元数据（文件名、架构、基址、MD5、SHA256、文件大小） |
-| `wait_analysis` | 等待自动分析完成 |
+| `wait_analysis` | 推进自动分析，直到完成或超时，并报告进度 |
 | `save_database` | 保存 IDA 数据库到磁盘 *（写入）* |
 
 #### 分析功能
@@ -670,11 +695,12 @@ ida_auto_mcp/
 ├── mcp_server.py    # MCP 协议实现（stdio + HTTP 传输）、超时控制
 ├── _registry.py     # 全局 McpServer 实例 + 工具装饰器
 ├── session.py       # 多文件会话管理（基于 idalib）
+├── analysis.py      # 把 IDA 自动分析拆成有限的步骤执行
 ├── idb_files.py     # IDA 打开数据库前检查其文件
 └── tools.py         # 55 个 IDA 分析工具
 ```
 
-测试不需要安装 IDA，覆盖工具权限、HTTP 检查、协议层（版本协商、标注、超时、取消、调用记录）、`run_script`、数据库文件检查和加载选项：
+测试不需要安装 IDA，覆盖工具权限、HTTP 检查、协议层（版本协商、标注、超时、取消、调用记录、后台任务）、`run_script`、数据库文件检查和加载选项，并用 IDA 模块的替身测试分析步骤、随之刷新的缓存以及拆成多块的函数：
 
 ```bash
 python -m unittest discover -s tests -v
